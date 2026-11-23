@@ -1,0 +1,2455 @@
+import time
+import io
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator, ScalarFormatter
+from scipy.interpolate import PchipInterpolator
+from numba import njit
+
+# Numba disk caching is switched off (cache=False). Caching needs the script
+# to be saved as a .py file in a writable folder; in Spyder/Jupyter or an
+# unsaved editor tab it fails with 'no locator available'. Functions are
+# still compiled, just again at each run.
+
+
+# ================================================================
+# MA et al. PCL/CALB
+# NIWA SPATIAL LATTICE MODEL WITH A SINGLE DEGRADED STATE D
+# NO INHIBITION / WITH AMORPHISATION
+# EXACT PDE-FITTED PARAMETERS TRANSFERRED WITHOUT CA REFITTING
+# ================================================================
+#
+# Reaction network:
+#
+#   E + C  --k2--> ZC
+#   ZC     --kc--> E + D
+#   ZC     --km--> E + A
+#   E + A  --k1--> ZA
+#   ZA     --ka--> E + D
+#   D      --ke--> P + V
+#
+# where
+#   C  = crystalline polymer
+#   A  = amorphous polymer
+#   ZC = enzyme-bound crystalline complex
+#   ZA = enzyme-bound amorphous complex
+#   D  = retained degraded polymer
+#   V  = void
+#   E  = active enzyme
+#   P  = released degradation product
+#
+# IMPORTANT SIMPLIFICATION
+# ------------------------
+# Only the NIWA mechanism is retained. There is no inhibited-enzyme state,
+# no inhibition rate constant, and no alternative model-variant machinery.
+#
+# No molecular-weight distribution, degree of polymerisation, computational
+# chains, D1/D2 daughter fragments, chain splitting, Mn, Mw or PDI are modelled.
+#
+# Each spatial cell carries local normalised mass fractions
+#
+#       C + A + ZC + ZA + D + V = 1.
+#
+# Degradation transfers polymer mass directly from ZC or ZA into D. Erosion
+# subsequently transfers D into void V and adds the released fraction to the
+# well-mixed product pool P.
+#
+# Local porosity is
+#
+#       phi = V
+#
+# and enzyme transport is pore-gated. At a face between neighbouring cells,
+#
+#       D_E,f = De0 * max(phi_L, phi_R).
+#
+# Active enzyme is prescribed on all four exposed boundaries:
+#
+#       E = E_T on the boundary.
+#
+# NO KINETIC PARAMETER IS FITTED IN THIS SCRIPT.
+# ================================================================
+
+
+# ================================================================
+# MODEL / GEOMETRY / TIME
+# ================================================================
+
+MODEL_NAME = 'NIWA'
+MODEL_DESCRIPTION = 'No Inhibition With Amorphisation'
+
+GRADES = ['PCL6300', 'PCL6500', 'PCL6800']
+
+# True redraws saved curve CSVs without repeating the lattice simulation.
+# Alternatively run this script with --curves-only.
+REDRAW_CURVES_ONLY = False
+
+# Physical specimen cross-section [mm].
+LX, LY = 0.30, 10.0
+
+# 30 rows across 0.30 mm: 30 x 1000 lattice, 0.010 mm square cells.
+N_ROWS = 30
+NX = int(N_ROWS)
+if NX < 3:
+    raise ValueError('N_ROWS must be at least 3 for the implicit diffusion solver.')
+
+PHYSICAL_ASPECT_RATIO = LY / LX
+NY = max(3, int(round(NX * PHYSICAL_ASPECT_RATIO)))
+
+DX = LX / NX
+DY = LY / NY
+CELL_AREA = DX * DY
+CELL_ASPECT_ERROR = abs(DX - DY) / DX
+
+print(
+    f'Automatic grid: N_ROWS={N_ROWS} -> NX={NX}, NY={NY}; '
+    f'dx={DX:.8g} mm, dy={DY:.8g} mm; '
+    f'physical aspect ratio={PHYSICAL_ASPECT_RATIO:.8g}; '
+    f'cell-size mismatch={100.0 * CELL_ASPECT_ERROR:.5f}%'
+)
+
+if NX % 3 != 0:
+    print(
+        'NOTE: for the 0.30 x 10 mm specimen, choosing N_ROWS as a multiple '
+        'of 3 gives exactly square cells (for example 30, 45, 60, 90).'
+    )
+
+DT = 0.005
+T_END = 20.0
+NSTEPS = int(round(T_END / DT))
+
+# Boundary active-enzyme level E_T, the same value as in the PDE calibration.
+# Like every kinetic and transport parameter, it is transferred unchanged.
+E_T = 0.50
+PH0 = 7.2
+
+# Initial morphology: each cell is crystalline or amorphous at random, with
+# exactly round(XC0 * NX * NY) crystalline cells.
+SEED0 = 20260831
+
+T_EXP = np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], dtype=float)
+REC_STEPS = {int(round(t / DT)): i for i, t in enumerate(T_EXP)}
+SNAP_STEPS = {int(round(t / DT)): float(t) for t in T_EXP}
+
+# Display-only controls.
+# Snapshots are rendered deterministically at lattice resolution: one image
+# pixel per lattice cell, coloured from that cell's simulated mass fractions.
+# No random numbers are used in any figure.
+
+PHASE_SNAPSHOT_FIGSIZE = (22, 16)
+PHASE_SNAPSHOT_HSPACE = 0.08
+PHASE_SNAPSHOT_TIME_FONTSIZE = 18
+PHASE_SNAPSHOT_TITLE_FONTSIZE = 21
+
+SEM_COMPARE_CENTER_WINDOW_MM = 0.31
+SEM_COMPARE_FIGSIZE = (12, 22)
+SEM_COMPARE_HSPACE = 0.055
+SEM_COMPARE_TIME_FONTSIZE = 17
+SEM_COMPARE_TITLE_FONTSIZE = 22
+SEM_COMPARE_VARIANT_FONTSIZE = 18
+
+# Snapshot legend typography.
+PHASE_LEGEND_FONTSIZE = 15
+PHASE_LEGEND_NCOL = 6
+COMBINED_SNAPSHOT_LEGEND_FONTSIZE = 15
+COMBINED_SNAPSHOT_LEGEND_NCOL = 3
+BW_SNAPSHOT_LEGEND_FONTSIZE = 15
+BW_SNAPSHOT_LEGEND_NCOL = 2
+
+
+# ================================================================
+# MATERIAL STATE CODES
+# ================================================================
+
+STATE_C  = 0
+STATE_A  = 1
+STATE_ZC = 2
+STATE_ZA = 3
+STATE_D  = 4
+STATE_V  = 5
+N_STATES = 6
+
+STATE_NAMES = ['C', 'A', 'ZC', 'ZA', 'D', 'V']
+
+
+# ================================================================
+# EXPERIMENTAL DATA
+# ================================================================
+
+DATA = {
+    'PCL6300': dict(
+        XC0=0.65,
+        WL=np.array([0, 9, 18, 38, 54, 67, 85, 86, 87.0]),
+        Xc=np.array([65, 62, 59, 51, 35, 9, 8.8, 8, 6.0]),
+        pH=np.array([7.20, 6.64, 6.28, 5.93, 5.57, 4.86, 4.50, 4.34, 4.11]),
+    ),
+    'PCL6500': dict(
+        XC0=0.60,
+        WL=np.array([0, 9, 16, 38, 54, 70, 82, 83, 84.0]),
+        Xc=np.array([60, 59, 56, 49, 36, 5, 4, 3, 2.0]),
+        pH=np.array([7.20, 6.96, 6.49, 6.02, 5.63, 5.17, 4.72, 4.49, 4.39]),
+    ),
+    'PCL6800': dict(
+        XC0=0.60,
+        WL=np.array([0, 11, 23, 43, 61, 70, 83, 84, 85.0]),
+        Xc=np.array([60, 58, 56, 52, 36, 5, 3.5, 3, 2.0]),
+        pH=np.array([7.20, 6.86, 6.44, 5.85, 5.51, 5.01, 4.63, 4.29, 4.23]),
+    ),
+}
+
+
+# ================================================================
+# NIWA PDE-FITTED PARAMETERS
+# ================================================================
+#
+# NIWA PDE estimates from the PDE chapter, transferred to this spatial
+# lattice implementation without CA refitting.
+#
+# ki is absent because NIWA contains no inhibition.
+# ================================================================
+
+# NIWA parameters as reported in the PDE chapter (Table tab:PCL_IWA_NIWA),
+# fixed and transferred to this lattice without refitting. The table values
+# are rounded to two significant figures.
+# These are the GLOBAL NIWA estimates (differential evolution + refinement,
+# bounds [1e-8, 50], all parameters free), November 2026.
+#
+# NAME MAPPING BETWEEN THE PDE TABLE AND THIS CA CODE:
+#   k_bind,C  -> CA k2      (E + C -> ZC)
+#   k_bind,A  -> CA k1      (E + A -> ZA)
+#   k_m       -> CA km      (ZC -> E + A)
+#   k_c, k_a, k_e, D_e0, alpha_pH keep their names.
+#
+# No parameter is refitted in this CA script.
+PARAMS = {
+    'PCL6300': dict(
+        k2=50.0,
+        k1=16.0,
+        kc=2.1,
+        ka=7.4e-02,
+        km=5.9e-08,
+        ke=50.0,
+        De0=3.2e-03,
+        alpha=3.4,
+    ),
+    'PCL6500': dict(
+        k2=2.7,
+        k1=50.0,
+        kc=50.0,
+        ka=7.3e-02,
+        km=4.5e-06,
+        ke=50.0,
+        De0=7.9e-03,
+        alpha=3.1,
+    ),
+    'PCL6800': dict(
+        k2=5.5,
+        k1=50.0,
+        kc=50.0,
+        ka=8.8e-02,
+        km=1.2e-06,
+        ke=50.0,
+        De0=4.6e-03,
+        alpha=3.2,
+    ),
+}
+
+
+# ================================================================
+# OUTPUT DIRECTORY
+# ================================================================
+
+try:
+    BASE_DIR = Path.home() / 'Downloads'
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    BASE_DIR = Path.cwd()
+
+OUTPUT_ROOT = BASE_DIR / 'MA_NIWA_SINGLE_D_CHAPTER6_RANDOM'
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+OVERVIEW_DIR = OUTPUT_ROOT / 'ALL_GRADES_OVERVIEW'
+OVERVIEW_DIR.mkdir(parents=True, exist_ok=True)
+
+PNG_FALLBACK_DIR = BASE_DIR / 'NIWA_PNG_EXPORTS'
+PNG_FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
+SVG_FALLBACK_DIR = BASE_DIR / 'NIWA_SVG_EXPORTS'
+SVG_FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
+
+print(f'Results will be saved in: {OUTPUT_ROOT}')
+
+
+def savefig_windows_safe(fig, path, *, dpi=None, bbox_inches='tight', facecolor='white'):
+    """
+    Save a figure as a true PNG without asking PIL to open the Windows path.
+
+    Matplotlib renders the PNG into memory first. Python then writes the bytes
+    to disk. If the requested path cannot be written, a short fallback path in
+    Downloads/NIWA_PNG_EXPORTS is used.
+    """
+    path = Path(path).with_suffix('.png')
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    safe_name = ''.join(
+        ch for ch in path.name
+        if ord(ch) >= 32 and ch not in '<>:"/\\|?*'
+    ).strip().rstrip('.')
+
+    if not safe_name:
+        raise ValueError(f'Invalid output filename derived from: {path!r}')
+
+    safe_path = path.with_name(safe_name)
+
+    buffer = io.BytesIO()
+    kwargs = {
+        'format': 'png',
+        'bbox_inches': bbox_inches,
+        'facecolor': facecolor,
+    }
+    if dpi is not None:
+        kwargs['dpi'] = dpi
+
+    fig.savefig(buffer, **kwargs)
+    png_bytes = buffer.getvalue()
+    buffer.close()
+
+    try:
+        safe_path.write_bytes(png_bytes)
+        return safe_path
+    except OSError:
+        fallback_path = PNG_FALLBACK_DIR / safe_name
+        fallback_path.write_bytes(png_bytes)
+        return fallback_path
+
+
+# ================================================================
+# METRIC
+# ================================================================
+
+def r2_score(obs, pred):
+    obs = np.asarray(obs, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    ss_res = float(np.sum((obs - pred) ** 2))
+    ss_tot = float(np.sum((obs - np.mean(obs)) ** 2))
+    return np.nan if ss_tot <= 0.0 else 1.0 - ss_res / ss_tot
+
+
+# ================================================================
+# INITIALISATION
+# ================================================================
+
+def initialise_lattice(xc0, seed):
+    """
+    Initialise a spatially random C/A morphology.
+
+    Exactly round(xc0 * NX * NY) cells are initially crystalline; the rest are
+    amorphous. Each cell starts with one normalised unit of polymer mass.
+    """
+    n_cells = NX * NY
+    rng = np.random.default_rng(int(seed))
+    n_c = int(round(float(xc0) * n_cells))
+    phase = np.zeros(n_cells, dtype=np.uint8)
+    phase[:n_c] = 1
+    rng.shuffle(phase)
+    phase = phase.reshape(NX, NY)
+
+    M = np.zeros((N_STATES, NX, NY), dtype=np.float64)
+    M[STATE_C, :, :] = (phase == 1)
+    M[STATE_A, :, :] = (phase == 0)
+
+    E = np.zeros((NX, NY), dtype=np.float64)
+
+    # Prescribed active enzyme at all exposed boundaries.
+    E[0, :] = E_T
+    E[-1, :] = E_T
+    E[:, 0] = E_T
+    E[:, -1] = E_T
+
+    stats = dict(
+        total_cells=int(n_cells),
+        crystalline_cells=int(n_c),
+        amorphous_cells=int(n_cells - n_c),
+        realised_initial_Xc_pct=100.0 * n_c / n_cells,
+        initial_mass_per_cell=1.0,
+        total_initial_normalised_mass=float(n_cells),
+    )
+
+    return M, E, stats
+
+
+# ================================================================
+# REACTION STEP: NIWA ONLY
+# ================================================================
+
+@njit(cache=False)
+def reaction_step(M, E, k2, kc, km, k1, ka, ke, dt, ET):
+    """
+    Apply the NIWA reaction network over one reaction step.
+
+    The masses present at the START of the step determine eligibility.
+    Thus:
+      - newly generated D cannot erode in the same step;
+      - newly generated A cannot bind in the same step;
+      - newly generated ZC or ZA cannot turn over in the same step.
+
+    There is no inhibition reaction and no inhibited-enzyme state.
+    """
+    nx = M.shape[1]
+    ny = M.shape[2]
+
+    kc_total = kc + km
+    p_leave_c = 1.0 - np.exp(-kc_total * dt) if kc_total > 0.0 else 0.0
+    branch_d = kc / kc_total if kc_total > 0.0 else 1.0
+
+    p_leave_a = 1.0 - np.exp(-ka * dt) if ka > 0.0 else 0.0
+    p_erode = 1.0 - np.exp(-ke * dt) if ke > 0.0 else 0.0
+
+    released_mass = 0.0
+
+    for i in range(nx):
+        for j in range(ny):
+            c0  = M[STATE_C,  i, j]
+            a0  = M[STATE_A,  i, j]
+            zc0 = M[STATE_ZC, i, j]
+            za0 = M[STATE_ZA, i, j]
+            d0  = M[STATE_D,  i, j]
+            v0  = M[STATE_V,  i, j]
+
+            e0 = E[i, j]
+            if e0 < 0.0:
+                e0 = 0.0
+
+            p_attack_c = 1.0 - np.exp(-k2 * e0 * dt) if k2 > 0.0 else 0.0
+            p_attack_a = 1.0 - np.exp(-k1 * e0 * dt) if k1 > 0.0 else 0.0
+
+            # 1) Existing degraded polymer erodes:
+            #       D -> P + V
+            erode = d0 * p_erode
+            d = d0 - erode
+            v = v0 + erode
+            released_mass += erode
+
+            # 2) Existing amorphous complex degrades:
+            #       ZA -> E + D
+            za_to_d = za0 * p_leave_a
+            za = za0 - za_to_d
+            d += za_to_d
+
+            # 3) Existing amorphous polymer binds enzyme:
+            #       E + A -> ZA
+            a_to_za = a0 * p_attack_a
+            a = a0 - a_to_za
+            za += a_to_za
+
+            # 4) Existing crystalline complex either degrades or amorphises:
+            #       ZC -> E + D
+            #       ZC -> E + A
+            zc_leave = zc0 * p_leave_c
+            zc_to_d = zc_leave * branch_d
+            zc_to_a = zc_leave - zc_to_d
+
+            zc = zc0 - zc_leave
+            d += zc_to_d
+            a += zc_to_a
+
+            # 5) Existing crystalline polymer binds enzyme:
+            #       E + C -> ZC
+            c_to_zc = c0 * p_attack_c
+            c = c0 - c_to_zc
+            zc += c_to_zc
+
+            # Free active enzyme:
+            # binding consumes E; turnover releases E.
+            e_poly = e0 - c_to_zc - a_to_za + zc_leave + za_to_d
+            if e_poly < 0.0:
+                e_poly = 0.0
+
+            M[STATE_C,  i, j] = c
+            M[STATE_A,  i, j] = a
+            M[STATE_ZC, i, j] = zc
+            M[STATE_ZA, i, j] = za
+            M[STATE_D,  i, j] = d
+            M[STATE_V,  i, j] = v
+            E[i, j] = e_poly
+
+    # Dirichlet active-enzyme boundary condition.
+    for j in range(ny):
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+    for i in range(nx):
+        E[i, 0] = ET
+        E[i, ny - 1] = ET
+
+    total_initial_mass = float(nx * ny)
+    return released_mass / total_initial_mass
+
+
+# ================================================================
+# POROSITY-DEPENDENT ENZYME TRANSPORT
+# ================================================================
+
+@njit(cache=False)
+def fill_porosity(phi, M):
+    """Set local porosity equal to the local void fraction V."""
+    nx = phi.shape[0]
+    ny = phi.shape[1]
+
+    for i in range(nx):
+        for j in range(ny):
+            value = M[STATE_V, i, j]
+
+            if value < 0.0:
+                value = 0.0
+            elif value > 1.0:
+                value = 1.0
+
+            phi[i, j] = value
+
+
+@njit(cache=False)
+def diffuse_x(E, phi, De0, dt, dx, ET):
+    """
+    Implicit diffusion solve in the thickness direction.
+
+    Face diffusivity:
+        D_E,f = De0 * max(phi_L, phi_R)
+    """
+    nx, ny = E.shape
+    m = nx - 2
+
+    a = np.empty(m)
+    b = np.empty(m)
+    c = np.empty(m)
+    d = np.empty(m)
+    cp = np.empty(m)
+    rhs_p = np.empty(m)
+    sol = np.empty(m)
+
+    inv = 1.0 / (dx * dx)
+
+    for j in range(ny):
+        for q in range(m):
+            i = q + 1
+
+            Dl = De0 * max(phi[i - 1, j], phi[i, j])
+            Dr = De0 * max(phi[i, j], phi[i + 1, j])
+
+            ll = dt * Dl * inv
+            lr = dt * Dr * inv
+
+            a[q] = -ll
+            b[q] = 1.0 + ll + lr
+            c[q] = -lr
+            d[q] = E[i, j]
+
+        d[0] -= a[0] * ET
+        a[0] = 0.0
+
+        d[m - 1] -= c[m - 1] * ET
+        c[m - 1] = 0.0
+
+        cp[0] = c[0] / b[0]
+        rhs_p[0] = d[0] / b[0]
+
+        for q in range(1, m):
+            den = b[q] - a[q] * cp[q - 1]
+
+            if q < m - 1:
+                cp[q] = c[q] / den
+
+            rhs_p[q] = (d[q] - a[q] * rhs_p[q - 1]) / den
+
+        sol[m - 1] = rhs_p[m - 1]
+
+        for q in range(m - 2, -1, -1):
+            sol[q] = rhs_p[q] - cp[q] * sol[q + 1]
+
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+        for q in range(m):
+            E[q + 1, j] = sol[q]
+
+
+@njit(cache=False)
+def diffuse_y(E, phi, De0, dt, dy, ET):
+    """
+    Implicit diffusion solve in the longitudinal direction.
+
+    Face diffusivity:
+        D_E,f = De0 * max(phi_L, phi_R)
+    """
+    nx, ny = E.shape
+    m = ny - 2
+
+    a = np.empty(m)
+    b = np.empty(m)
+    c = np.empty(m)
+    d = np.empty(m)
+    cp = np.empty(m)
+    rhs_p = np.empty(m)
+    sol = np.empty(m)
+
+    inv = 1.0 / (dy * dy)
+
+    for i in range(1, nx - 1):
+        for q in range(m):
+            j = q + 1
+
+            Dl = De0 * max(phi[i, j - 1], phi[i, j])
+            Dr = De0 * max(phi[i, j], phi[i, j + 1])
+
+            ll = dt * Dl * inv
+            lr = dt * Dr * inv
+
+            a[q] = -ll
+            b[q] = 1.0 + ll + lr
+            c[q] = -lr
+            d[q] = E[i, j]
+
+        d[0] -= a[0] * ET
+        a[0] = 0.0
+
+        d[m - 1] -= c[m - 1] * ET
+        c[m - 1] = 0.0
+
+        cp[0] = c[0] / b[0]
+        rhs_p[0] = d[0] / b[0]
+
+        for q in range(1, m):
+            den = b[q] - a[q] * cp[q - 1]
+
+            if q < m - 1:
+                cp[q] = c[q] / den
+
+            rhs_p[q] = (d[q] - a[q] * rhs_p[q - 1]) / den
+
+        sol[m - 1] = rhs_p[m - 1]
+
+        for q in range(m - 2, -1, -1):
+            sol[q] = rhs_p[q] - cp[q] * sol[q + 1]
+
+        E[i, 0] = ET
+        E[i, ny - 1] = ET
+
+        for q in range(m):
+            E[i, q + 1] = sol[q]
+
+    for j in range(ny):
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+    for i in range(nx):
+        E[i, 0] = ET
+        E[i, ny - 1] = ET
+
+
+# ================================================================
+# OBSERVABLES
+# ================================================================
+
+def observables(M, E, product_pool, alpha):
+    masses = np.sum(M, axis=(1, 2))
+
+    nC  = float(masses[STATE_C])
+    nA  = float(masses[STATE_A])
+    nZC = float(masses[STATE_ZC])
+    nZA = float(masses[STATE_ZA])
+    nD  = float(masses[STATE_D])
+    nV  = float(masses[STATE_V])
+
+    total_initial_mass = float(NX * NY)
+    solid = nC + nA + nZC + nZA + nD
+
+    # Weight loss is the fraction transferred to void.
+    wl = 100.0 * nV / total_initial_mass
+
+    # Remaining crystallinity is crystalline polymer plus crystalline complex
+    # relative to the mass that remains in the solid.
+    xc = 100.0 * (nC + nZC) / solid if solid > 0.0 else 0.0
+
+    # Retained degraded polymer among the remaining solid.
+    degraded_fraction = 100.0 * nD / solid if solid > 0.0 else 0.0
+
+    # Well-mixed product-pH relation transferred from the fitted PDE model.
+    ph = PH0 - alpha * product_pool
+
+    cell_sum = np.sum(M, axis=0)
+    max_mass_error = float(np.max(np.abs(cell_sum - 1.0)))
+
+    return dict(
+        WL=wl,
+        Xc=xc,
+        Degraded_fraction=degraded_fraction,
+        pH=ph,
+        P_free=float(product_pool),
+        C_pct=100.0 * nC / total_initial_mass,
+        A_pct=100.0 * nA / total_initial_mass,
+        ZC_pct=100.0 * nZC / total_initial_mass,
+        ZA_pct=100.0 * nZA / total_initial_mass,
+        D_pct=100.0 * nD / total_initial_mass,
+        V_pct=100.0 * nV / total_initial_mass,
+        E_mean=float(np.mean(E)),
+        max_cell_mass_error=max_mass_error,
+    )
+
+
+# ================================================================
+# ONE PCL-GRADE SIMULATION
+# ================================================================
+
+def simulate(grade, seed, save_snapshots=True):
+    p = PARAMS[grade]
+
+    M, E, init_stats = initialise_lattice(DATA[grade]['XC0'], seed)
+
+    columns = [
+        'time_h',
+        'WL_model_pct',
+        'Xc_model_pct',
+        'Degraded_fraction_pct',
+        'pH_model',
+        'P_free',
+        'C_pct',
+        'A_pct',
+        'ZC_pct',
+        'ZA_pct',
+        'D_pct',
+        'V_pct',
+        'E_mean',
+        'max_cell_mass_error',
+    ]
+
+    rec = np.zeros((len(T_EXP), len(columns)), dtype=float)
+    snapshots = {}
+
+    product_pool = 0.0
+    phi = np.zeros((NX, NY), dtype=np.float64)
+
+    for step in range(NSTEPS + 1):
+        if step in REC_STEPS:
+            idx = REC_STEPS[step]
+            vals = observables(M, E, product_pool, p['alpha'])
+
+            rec[idx, :] = [
+                step * DT,
+                vals['WL'],
+                vals['Xc'],
+                vals['Degraded_fraction'],
+                vals['pH'],
+                vals['P_free'],
+                vals['C_pct'],
+                vals['A_pct'],
+                vals['ZC_pct'],
+                vals['ZA_pct'],
+                vals['D_pct'],
+                vals['V_pct'],
+                vals['E_mean'],
+                vals['max_cell_mass_error'],
+            ]
+
+        if save_snapshots and step in SNAP_STEPS:
+            snapshots[SNAP_STEPS[step]] = dict(
+                mass_fractions=np.transpose(M, (1, 2, 0)).astype(np.float32),
+                state_mass_totals=np.sum(M, axis=(1, 2)).copy(),
+                E=E.copy(),
+                P_free=float(product_pool),
+            )
+
+        if step == NSTEPS:
+            break
+
+        # Sequential update of one time step DT:
+        # reaction step over DT, then enzyme transport step over DT.
+        # The porosity used for transport is taken after the reaction step.
+
+        released = reaction_step(
+            M,
+            E,
+            p['k2'],
+            p['kc'],
+            p['km'],
+            p['k1'],
+            p['ka'],
+            p['ke'],
+            DT,
+            E_T,
+        )
+        product_pool = max(product_pool + released, 0.0)
+
+        fill_porosity(phi, M)
+
+        diffuse_x(
+            E,
+            phi,
+            p['De0'],
+            DT,
+            DX,
+            E_T,
+        )
+
+        diffuse_y(
+            E,
+            phi,
+            p['De0'],
+            DT,
+            DY,
+            E_T,
+        )
+
+    out = pd.DataFrame(rec, columns=columns)
+    out.attrs['initialisation_stats'] = init_stats
+
+    return out, snapshots
+
+
+# ================================================================
+# SNAPSHOT RENDERING
+# ================================================================
+
+# One unique colour per species, including the two enzyme-bound complexes.
+C_COL  = np.array([0.90, 0.00, 0.00])    # crystalline polymer        red
+ZC_COL = np.array([0.50, 0.10, 0.60])    # crystalline complex        purple
+A_COL  = np.array([0.10, 0.34, 0.70])    # amorphous polymer          blue
+ZA_COL = np.array([0.10, 0.65, 0.25])    # amorphous complex          green
+D_COL  = np.array([0.95, 0.70, 0.05])    # retained degraded polymer  amber
+V_COL  = np.array([1.00, 1.00, 1.00])    # void                       white
+
+# SUB-CELL SQUARE RENDERING, ONE PURE COLOUR PER SQUARE
+# -----------------------------------------------------
+# Each lattice cell is drawn as a SUBCELL_N x SUBCELL_N grid of square
+# display pixels, K = SUBCELL_N**2 squares in total. No colours are blended:
+# every square shows exactly one species in that species' own colour.
+#
+# With s = 1 - V the remaining solid fraction of a cell:
+#
+#   s <= VOID_THRESHOLD : the cell is VOID and drawn completely white;
+#   s >  VOID_THRESHOLD : the cell has n_solid = max(1, round(s * K)) solid
+#                         squares; the other squares are white void.
+#
+# The n_solid squares are shared between C, ZC, A, ZA and D in proportion to
+# their mass fractions in the cell (largest-remainder rounding, so the counts
+# always add up to n_solid). A species therefore appears in a cell once it
+# holds roughly 1/K of the cell (about 2 % for SUBCELL_N = 7); smaller amounts,
+# such as the retained degraded polymer D, are below the display resolution.
+#
+# Because transfers remove a proportion 1 - exp(-k dt) of what is present,
+# eroding solid decays geometrically and never reaches exactly zero. A cell
+# whose remaining solid is at most VOID_THRESHOLD (1e-6 of its initial mass)
+# is therefore classed as void. This is a display and classification rule
+# only; the simulated mass fractions are not altered.
+#
+# The model stores how much of each species a cell holds, not where it sits
+# inside the cell. Each cell is therefore given ONE random order of its K
+# squares, drawn once with DISPLAY_SEED and reused at every snapshot time.
+# Squares become void in that order as V increases, so a square that is void
+# at one time stays void at all later times, and the solid squares are filled
+# in the fixed species order SPECIES_DRAW_ORDER. The random positions affect
+# the figures only; the simulation, its seed and all reported results are
+# unchanged.
+SUBCELL_N = 7
+VOID_THRESHOLD = 1.0e-6
+DISPLAY_SEED = SEED0 + 500000     # separate from the simulation seed
+
+_SQUARE_RANK_CACHE = {}
+
+
+def square_removal_rank(nx, ny, n=SUBCELL_N):
+    """
+    Fixed removal order of the n x n squares of every cell,
+    shape (nx, n, ny, n), indexed [i, sub-row, j, sub-column].
+
+    rank = r means that square is the (r + 1)-th of its cell to be removed.
+    The order is a random permutation per cell, drawn once and reused for
+    every snapshot, so erosion is monotone in time.
+    """
+    key = (nx, ny, n)
+    if key not in _SQUARE_RANK_CACHE:
+        rng = np.random.default_rng(DISPLAY_SEED)
+        keys = rng.random((nx, ny, n * n))
+        rank = np.argsort(np.argsort(keys, axis=2), axis=2)
+        rank = rank.reshape(nx, ny, n, n).transpose(0, 2, 1, 3)
+        _SQUARE_RANK_CACHE[key] = rank
+    return _SQUARE_RANK_CACHE[key]
+
+# Solid squares are filled in this order, starting next to the void squares.
+SPECIES_DRAW_ORDER = [STATE_D, STATE_ZA, STATE_ZC, STATE_A, STATE_C]
+
+SPECIES_COLOURS = np.zeros((N_STATES, 3))
+SPECIES_COLOURS[STATE_C] = C_COL
+SPECIES_COLOURS[STATE_ZC] = ZC_COL
+SPECIES_COLOURS[STATE_A] = A_COL
+SPECIES_COLOURS[STATE_ZA] = ZA_COL
+SPECIES_COLOURS[STATE_D] = D_COL
+SPECIES_COLOURS[STATE_V] = V_COL
+
+if len({tuple(np.round(c, 3)) for c in SPECIES_COLOURS}) != N_STATES:
+    raise ValueError('Every species must have its own colour.')
+
+PHASE_LEGEND = [
+    Patch(facecolor=C_COL, edgecolor='black', label='Crystalline (C)'),
+    Patch(facecolor=ZC_COL, edgecolor='black', label='Crystalline complex (ZC)'),
+    Patch(facecolor=A_COL, edgecolor='black', label='Amorphous (A)'),
+    Patch(facecolor=ZA_COL, edgecolor='black', label='Amorphous complex (ZA)'),
+    Patch(facecolor=D_COL, edgecolor='black', label='Degraded (D)'),
+    Patch(facecolor=V_COL, edgecolor='black', label='Void (V)'),
+]
+
+SEM_SOLID_COL = np.array([0.55, 0.55, 0.55])
+SEM_VOID_COL  = np.array([1.00, 1.00, 1.00])
+SEM_BW_LEGEND = [
+    Patch(facecolor=SEM_SOLID_COL, edgecolor='black', label='Polymer solid (C, ZC, A, ZA, D)'),
+    Patch(facecolor=SEM_VOID_COL, edgecolor='black', label='Void (V)'),
+]
+
+
+def phase_fractions(snapshot):
+    f = snapshot['mass_fractions']
+
+    return (
+        f[:, :, STATE_C],
+        f[:, :, STATE_A],
+        f[:, :, STATE_ZC],
+        f[:, :, STATE_ZA],
+        f[:, :, STATE_D],
+        f[:, :, STATE_V],
+    )
+
+
+def subcell_solid_mask(solid_fraction, n=SUBCELL_N):
+    """
+    Sub-cell square mask, shape (NX * n, NY * n).
+
+    A cell with solid_fraction <= VOID_THRESHOLD is void and receives no solid
+    squares. Any other cell receives max(1, round(solid_fraction * n * n))
+    solid squares, capped at n * n; the n * n - n_solid squares with the
+    lowest fixed removal rank are void.
+    """
+    nx, ny = solid_fraction.shape
+    k = n * n
+    s = np.clip(solid_fraction, 0.0, 1.0)
+
+    n_solid = np.where(
+        s <= VOID_THRESHOLD,
+        0,
+        np.clip(np.rint(s * k), 1, k),
+    ).astype(np.int32)
+
+    rank = square_removal_rank(nx, ny, n)
+    mask = rank >= (k - n_solid)[:, None, :, None]
+
+    return mask.reshape(nx * n, ny * n)
+
+
+def solid_square_count(solid_fraction, n=SUBCELL_N):
+    """Number of solid squares per cell (same rule as subcell_solid_mask)."""
+    k = n * n
+    s = np.clip(solid_fraction, 0.0, 1.0)
+    return np.where(
+        s <= VOID_THRESHOLD,
+        0,
+        np.clip(np.rint(s * k), 1, k),
+    ).astype(np.int32)
+
+
+def species_square_counts(snapshot, n=SUBCELL_N):
+    """
+    Squares given to each solid species in every cell, shape
+    (len(SPECIES_DRAW_ORDER), NX, NY). The counts add up to the number of
+    solid squares of the cell (largest-remainder rounding).
+    """
+    f = np.asarray(snapshot['mass_fractions'], dtype=np.float64)
+    masses = np.stack([np.clip(f[:, :, st], 0.0, None) for st in SPECIES_DRAW_ORDER])
+    solid = masses.sum(axis=0)
+
+    n_solid = solid_square_count(solid, n)
+    safe = np.where(solid > 0.0, solid, 1.0)
+    quota = masses / safe * n_solid
+
+    counts = np.floor(quota).astype(np.int32)
+    left = n_solid - counts.sum(axis=0)
+
+    # Give the squares still unassigned to the largest fractional parts.
+    frac = quota - counts
+    order = np.argsort(-frac, axis=0, kind='stable')
+    position = np.argsort(order, axis=0, kind='stable')
+    counts += (position < left[None, :, :]).astype(np.int32)
+
+    return counts, n_solid
+
+
+def fraction_preserving_phase_image(snapshot, n=SUBCELL_N):
+    """
+    Render the simulated composition of every lattice cell with one unique
+    colour per species (C, ZC, A, ZA, D and void).
+
+    Each cell is an n x n block of square pixels. A proportion (1 - V) of the
+    squares is solid and the rest is white void. The solid squares are shared
+    between the five solid species in proportion to their mass fractions, and
+    each square is drawn in the pure colour of its species. Image shape is
+    (NX * n, NY * n, 3).
+    """
+    counts, n_solid = species_square_counts(snapshot, n)
+    nx, ny = n_solid.shape
+    k = n * n
+
+    rank = square_removal_rank(nx, ny, n)                 # (nx, n, ny, n)
+    # Position of each square among the solid squares of its cell; negative
+    # values are void squares.
+    solid_index = rank - (k - n_solid)[:, None, :, None]
+
+    image = np.empty((nx, n, ny, n, 3), dtype=np.float64)
+    image[...] = V_COL
+
+    upper = np.zeros((nx, ny), dtype=np.int32)
+    for q, state in enumerate(SPECIES_DRAW_ORDER):
+        lower = upper
+        upper = lower + counts[q]
+        sel = (
+            (solid_index >= lower[:, None, :, None])
+            & (solid_index < upper[:, None, :, None])
+        )
+        image[sel] = SPECIES_COLOURS[state]
+
+    return image.reshape(nx * n, ny * n, 3)
+
+
+def sem_binary_phase_image(snapshot, n=SUBCELL_N):
+    """
+    Render an SEM-style solid/void image.
+
+    Each cell is an n x n block of square pixels; a proportion (1 - V) of the
+    squares is grey polymer solid and the rest is white void. Image shape is
+    (NX * n, NY * n, 3).
+    """
+    cf, af, zcf, zaf, df, vf = phase_fractions(snapshot)
+
+    solid = np.clip(cf + af + zcf + zaf + df, 0.0, 1.0)
+    mask = subcell_solid_mask(solid, n)
+
+    return np.where(mask[:, :, None], SEM_SOLID_COL, SEM_VOID_COL)
+
+
+def save_phase_snapshot_evolution(grade, snapshots, outdir):
+    path = outdir / f'{grade}_NIWA_grid_evolution_C_A_D_V.png'
+
+    fig, axes = plt.subplots(
+        len(T_EXP),
+        1,
+        figsize=PHASE_SNAPSHOT_FIGSIZE,
+        facecolor='white',
+        gridspec_kw={'hspace': PHASE_SNAPSHOT_HSPACE},
+    )
+
+    axes = np.atleast_1d(axes).ravel()
+
+    for row, t in enumerate(T_EXP):
+        snap = snapshots[float(t)]
+        rgb = fraction_preserving_phase_image(snap)
+
+        ax = axes[row]
+
+        ax.imshow(
+            rgb,
+            extent=[0.0, LY, LX, 0.0],
+            origin='upper',
+            interpolation='nearest',
+            aspect='auto',
+        )
+
+        ax.set_xlim(0.0, LY)
+        ax.set_ylim(LX, 0.0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        ax.text(
+            -0.012,
+            0.50,
+            f't = {t:g} h',
+            transform=ax.transAxes,
+            ha='right',
+            va='center',
+            fontsize=PHASE_SNAPSHOT_TIME_FONTSIZE,
+            fontweight='bold',
+            clip_on=False,
+        )
+
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.8)
+            spine.set_color('black')
+
+    fig.legend(
+        handles=PHASE_LEGEND,
+        loc='lower center',
+        ncol=PHASE_LEGEND_NCOL,
+        frameon=True,
+        fontsize=PHASE_LEGEND_FONTSIZE,
+        bbox_to_anchor=(0.5, 0.02),
+        handlelength=1.8,
+        handletextpad=0.7,
+        columnspacing=1.2,
+        borderpad=0.8,
+        labelspacing=0.7,
+    )
+
+
+    fig.subplots_adjust(
+        left=0.09,
+        right=0.89,
+        top=0.94,
+        bottom=0.14,
+    )
+
+    path = savefig_windows_safe(
+        fig,
+        path,
+        dpi=300,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
+    plt.close(fig)
+    return path
+
+
+def save_enzyme_snapshot_evolution(grade, snapshots, outdir):
+    path = outdir / f'{grade}_NIWA_enzyme_evolution.png'
+
+    fig, axes = plt.subplots(
+        len(T_EXP),
+        1,
+        figsize=(20, 14.5),
+        facecolor='white',
+    )
+
+    axes = np.atleast_1d(axes).ravel()
+
+    for row, t in enumerate(T_EXP):
+        snap = snapshots[float(t)]
+        display = snap['E']
+
+        ax = axes[row]
+
+        im = ax.imshow(
+            display,
+            extent=[0.0, LY, LX, 0.0],
+            origin='upper',
+            interpolation='nearest',
+            aspect='auto',
+            cmap='viridis',
+            vmin=0.0,
+            vmax=E_T,
+        )
+
+        ax.set_xlim(0.0, LY)
+        ax.set_ylim(LX, 0.0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        ax.text(
+            -0.012,
+            0.50,
+            f't = {t:g} h',
+            transform=ax.transAxes,
+            ha='right',
+            va='center',
+            fontsize=16,
+            fontweight='bold',
+        )
+
+    cbar = fig.colorbar(
+        im,
+        ax=axes.tolist(),
+        orientation='horizontal',
+        fraction=0.02,
+        pad=0.035,
+    )
+
+    cbar.set_label('Active enzyme concentration E', fontsize=12)
+
+
+    fig.subplots_adjust(
+        left=0.095,
+        right=0.985,
+        top=0.965,
+        bottom=0.08,
+        hspace=0.26,
+    )
+
+    path = savefig_windows_safe(
+        fig,
+        path,
+        dpi=300,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
+    plt.close(fig)
+    return path
+
+
+def _centre_crop_phase_rgb_for_sem(rgb, window_mm=SEM_COMPARE_CENTER_WINDOW_MM):
+    rgb = np.asarray(rgb)
+
+    if rgb.ndim != 3 or rgb.shape[1] < 1:
+        return rgb
+
+    window_mm = float(np.clip(window_mm, DX, LY))
+    pixels_per_mm_y = rgb.shape[1] / float(LY)
+
+    crop_width = int(round(window_mm * pixels_per_mm_y))
+    crop_width = max(1, min(crop_width, rgb.shape[1]))
+
+    j0 = (rgb.shape[1] - crop_width) // 2
+
+    return rgb[:, j0:j0 + crop_width, :]
+
+
+def save_sem_center_zoom_evolution(grade, snapshots, outdir):
+    """
+    Save the central longitudinal window used for qualitative SEM comparison
+    for one grade.
+    """
+    fig, axes = plt.subplots(
+        len(T_EXP),
+        1,
+        figsize=SEM_COMPARE_FIGSIZE,
+        squeeze=False,
+        gridspec_kw={'hspace': SEM_COMPARE_HSPACE},
+    )
+
+    axes = axes[:, 0]
+
+    for r, t in enumerate(T_EXP):
+        snap = snapshots[float(t)]
+
+        rgb_full = fraction_preserving_phase_image(snap)
+
+        rgb_zoom = _centre_crop_phase_rgb_for_sem(rgb_full)
+        ax = axes[r]
+
+        ax.imshow(
+            rgb_zoom,
+            origin='upper',
+            interpolation='nearest',
+            aspect='equal',
+        )
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        ax.text(
+            -0.055,
+            0.50,
+            f'{t:g} h',
+            transform=ax.transAxes,
+            ha='right',
+            va='center',
+            fontsize=SEM_COMPARE_TIME_FONTSIZE,
+            fontweight='bold',
+            clip_on=False,
+        )
+
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.9)
+            spine.set_color('black')
+
+
+    fig.legend(
+        handles=PHASE_LEGEND,
+        loc='lower center',
+        ncol=COMBINED_SNAPSHOT_LEGEND_NCOL,
+        fontsize=COMBINED_SNAPSHOT_LEGEND_FONTSIZE,
+        bbox_to_anchor=(0.5, 0.008),
+        frameon=True,
+        handlelength=1.8,
+        handletextpad=0.7,
+        columnspacing=1.2,
+        borderpad=0.8,
+        labelspacing=0.7,
+    )
+
+    fig.subplots_adjust(
+        left=0.12,
+        right=0.96,
+        top=0.965,
+        bottom=0.075,
+        hspace=SEM_COMPARE_HSPACE,
+    )
+
+    path = outdir / f'{grade}_NIWA_SEM_CENTER_ZOOM_evolution.png'
+
+    path = savefig_windows_safe(
+        fig,
+        path,
+        dpi=300,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
+    plt.close(fig)
+    return path
+
+
+def save_all_grades_sem_center_zoom_comparison(all_snapshots):
+    """
+    Save one combined NIWA morphology panel with rows = times and
+    columns = polymer grades, so the three PCL grades can be compared
+    directly at each time.
+    """
+    fig, axes = plt.subplots(
+        len(T_EXP),
+        len(GRADES),
+        figsize=(12.5, 30.0),
+        squeeze=False,
+        gridspec_kw={
+            'hspace': SEM_COMPARE_HSPACE,
+            'wspace': 0.045,
+        },
+    )
+
+    for r, t in enumerate(T_EXP):
+        for c, grade in enumerate(GRADES):
+            snap = all_snapshots[grade][float(t)]
+
+            rgb_full = fraction_preserving_phase_image(snap)
+            rgb_zoom = _centre_crop_phase_rgb_for_sem(rgb_full)
+
+            ax = axes[r, c]
+            ax.imshow(
+                rgb_zoom,
+                origin='upper',
+                interpolation='nearest',
+                aspect='equal',
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            if r == 0:
+                ax.set_title(
+                    grade,
+                    fontsize=SEM_COMPARE_VARIANT_FONTSIZE,
+                    fontweight='bold',
+                    pad=6,
+                )
+
+            if c == 0:
+                ax.text(
+                    -0.08,
+                    0.50,
+                    f'{t:g} h',
+                    transform=ax.transAxes,
+                    ha='right',
+                    va='center',
+                    fontsize=SEM_COMPARE_TIME_FONTSIZE,
+                    fontweight='bold',
+                    clip_on=False,
+                )
+
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.9)
+                spine.set_color('black')
+
+
+    fig.legend(
+        handles=PHASE_LEGEND,
+        loc='lower center',
+        ncol=COMBINED_SNAPSHOT_LEGEND_NCOL,
+        fontsize=COMBINED_SNAPSHOT_LEGEND_FONTSIZE,
+        bbox_to_anchor=(0.5, 0.008),
+        frameon=True,
+        handlelength=1.8,
+        handletextpad=0.7,
+        columnspacing=1.2,
+        borderpad=0.8,
+        labelspacing=0.7,
+    )
+
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.99,
+        top=0.968,
+        bottom=0.090,
+        hspace=SEM_COMPARE_HSPACE,
+        wspace=0.045,
+    )
+
+    png_path = OVERVIEW_DIR / 'NIWA_ALL_PCL_MORPHOLOGY.png'
+
+    savefig_windows_safe(
+        fig,
+        png_path,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
+    plt.close(fig)
+    return png_path
+
+
+
+def save_all_grades_sem_center_zoom_bw_comparison(all_snapshots):
+    """
+    Save one combined grey-and-white NIWA morphology panel for SEM-style
+    comparison. All non-void material is grey; void is white.
+    """
+    fig, axes = plt.subplots(
+        len(T_EXP),
+        len(GRADES),
+        figsize=(12.5, 30.0),
+        squeeze=False,
+        facecolor='white',
+        gridspec_kw={
+            'hspace': SEM_COMPARE_HSPACE,
+            'wspace': 0.045,
+        },
+    )
+
+    for r, t in enumerate(T_EXP):
+        for c, grade in enumerate(GRADES):
+            snap = all_snapshots[grade][float(t)]
+
+            rgb_full = sem_binary_phase_image(snap)
+            rgb_zoom = _centre_crop_phase_rgb_for_sem(rgb_full)
+
+            ax = axes[r, c]
+            ax.imshow(
+                rgb_zoom,
+                origin='upper',
+                interpolation='nearest',
+                aspect='equal',
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            if r == 0:
+                ax.set_title(
+                    grade,
+                    fontsize=SEM_COMPARE_VARIANT_FONTSIZE,
+                    fontweight='bold',
+                    pad=6,
+                )
+
+            if c == 0:
+                ax.text(
+                    -0.08,
+                    0.50,
+                    f'{t:g} h',
+                    transform=ax.transAxes,
+                    ha='right',
+                    va='center',
+                    fontsize=SEM_COMPARE_TIME_FONTSIZE,
+                    fontweight='bold',
+                    clip_on=False,
+                )
+
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.9)
+                spine.set_color('black')
+
+
+    fig.legend(
+        handles=SEM_BW_LEGEND,
+        loc='lower center',
+        ncol=BW_SNAPSHOT_LEGEND_NCOL,
+        fontsize=BW_SNAPSHOT_LEGEND_FONTSIZE,
+        bbox_to_anchor=(0.5, 0.008),
+        frameon=True,
+        handlelength=1.8,
+        handletextpad=0.7,
+        columnspacing=1.4,
+        borderpad=0.8,
+        labelspacing=0.7,
+    )
+
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.99,
+        top=0.968,
+        bottom=0.085,
+        hspace=SEM_COMPARE_HSPACE,
+        wspace=0.045,
+    )
+
+    png_path = OVERVIEW_DIR / 'NIWA_ALL_PCL_MORPHOLOGY_SEM_GREY_WHITE.png'
+
+    savefig_windows_safe(
+        fig,
+        png_path,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
+    plt.close(fig)
+    return png_path
+
+# ================================================================
+# CURVES
+# ================================================================
+
+def smooth_curve(y):
+    t_smooth = np.linspace(T_EXP.min(), T_EXP.max(), 300)
+    y_smooth = PchipInterpolator(
+        T_EXP,
+        np.asarray(y, dtype=float),
+    )(t_smooth)
+
+    return t_smooth, y_smooth
+
+
+WL_COLOUR = '#0000FF'
+XC_COLOUR = '#FF0000'
+PH_COLOUR = '#008000'
+DEG_COLOUR = '#800080'
+
+
+def curve_colour(model_col):
+    if model_col == 'WL_model_pct':
+        return WL_COLOUR
+    if model_col == 'Xc_model_pct':
+        return XC_COLOUR
+    if model_col == 'pH_model':
+        return PH_COLOUR
+    if model_col == 'Degraded_fraction_pct':
+        return DEG_COLOUR
+    return 'black'
+
+
+def degraded_fraction_limits(series):
+    """Choose a linear display range in percent from the actual recorded values."""
+    finite = []
+    for values in series:
+        a = np.asarray(values, dtype=float).ravel()
+        finite.extend(a[np.isfinite(a)])
+    if not finite:
+        return (0.0, 1.0)
+    low, high = min(0.0, min(finite)), max(0.0, max(finite))
+    if low == high:
+        return (0.0, 1.0)  # Genuine all-zero output is annotated, never inflated.
+    margin = .12 * (high - low)
+    return (low - margin if low < 0 else 0.0, high + margin)
+
+
+def style_degraded_fraction_axis(ax, values, limits):
+    """Show small percentages clearly while leaving the curve values unchanged."""
+    ax.set_ylim(*limits)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+    formatter = ScalarFormatter(useMathText=True, useOffset=False)
+    formatter.set_scientific(True)
+    formatter.set_powerlimits((-3, 3))
+    ax.yaxis.set_major_formatter(formatter)
+    ax.set_ylabel('Degraded fraction (%)', fontsize=18, fontweight='bold')
+    ax.set_xlabel('Time (h)', fontsize=18, fontweight='bold')
+    ax.tick_params(axis='both', labelsize=16)
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontweight('bold')
+    offset = ax.yaxis.get_offset_text()
+    offset.set_fontsize(16)
+    offset.set_fontweight('bold')
+    a = np.asarray(values, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0 or np.all(a == 0.0):
+        message = 'No finite values' if a.size == 0 else 'All recorded values are zero'
+        ax.text(.98, .96, message, transform=ax.transAxes,
+                ha='right', va='top', fontsize=12, fontweight='bold')
+
+
+def save_grade_curves(grade, rec, outdir):
+    settings = [
+        (
+            'WL_model_pct',
+            'WL',
+            'Weight loss (%)',
+            (0, 100),
+            'o',
+            'weight_loss_fit',
+        ),
+        (
+            'Xc_model_pct',
+            'Xc',
+            'Remaining crystallinity (%)',
+            (0, 70),
+            's',
+            'crystallinity_fit',
+        ),
+        (
+            'Degraded_fraction_pct',
+            None,
+            'Degraded fraction (%)',
+            None,
+            None,
+            'degraded_fraction',
+        ),
+        (
+            'pH_model',
+            'pH',
+            'Bath pH',
+            (3.8, 7.4),
+            'd',
+            'pH_fit',
+        ),
+    ]
+
+    for model_col, obs_key, ylabel, ylim, marker, stem in settings:
+        fig, ax = plt.subplots(figsize=(8, 5.5))
+
+        if obs_key is not None:
+            ax.plot(
+                T_EXP,
+                DATA[grade][obs_key],
+                marker=marker,
+                linestyle='none',
+                color='black',
+                ms=9,
+                markerfacecolor='white',
+                markeredgewidth=1.6,
+                label=f'{grade} data',
+            )
+        else:
+            ax.plot(
+                T_EXP,
+                rec[model_col],
+                'o',
+                ms=7,
+                markerfacecolor='white',
+                label='NIWA output',
+            )
+
+        tsm, ysm = smooth_curve(rec[model_col])
+
+        if model_col in (
+            'WL_model_pct',
+            'Xc_model_pct',
+        ):
+            ysm = np.clip(ysm, 0.0, 100.0)
+
+        ax.plot(
+            tsm,
+            ysm,
+            lw=4,
+            color=curve_colour(model_col),
+            label='NIWA',
+        )
+
+        ax.set_xlabel('Time (h)', fontsize=18)
+        ax.set_ylabel(ylabel, fontsize=18)
+
+        ax.tick_params(
+            axis='both',
+            labelsize=16,
+        )
+
+        ax.xaxis.set_major_locator(
+            MaxNLocator(integer=True)
+        )
+
+        ax.set_xlim(-0.5, 20.5)
+        if model_col == 'Degraded_fraction_pct':
+            limits = degraded_fraction_limits([rec[model_col], ysm])
+            style_degraded_fraction_axis(ax, rec[model_col], limits)
+        else:
+            ax.set_ylim(*ylim)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=12, frameon=True)
+
+        fig.tight_layout()
+
+        path = outdir / f'{stem}_{grade}_NIWA.png'
+
+        savefig_windows_safe(
+            fig,
+            path,
+            dpi=600,
+            bbox_inches='tight',
+            facecolor='white',
+        )
+
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    ax.plot(
+        T_EXP,
+        rec['P_free'],
+        'o-',
+        lw=3,
+        color=DEG_COLOUR,
+        label='Released product P',
+    )
+
+    ax.set_xlabel('Time (h)', fontsize=18)
+    ax.set_ylabel('Product pool P', fontsize=18)
+
+    ax.tick_params(
+        axis='both',
+        labelsize=16,
+    )
+
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=12, frameon=True)
+
+    fig.tight_layout()
+
+    savefig_windows_safe(
+        fig,
+        outdir / f'product_pool_{grade}_NIWA.png',
+        dpi=600,
+        bbox_inches='tight',
+        facecolor='white',
+    )
+
+    plt.close(fig)
+
+
+def save_all_grades_overview(results):
+    settings = [
+        (
+            'WL_model_pct',
+            'WL',
+            'Weight loss (%)',
+            (0, 100),
+            'o',
+            'ALL_GRADES_NIWA_weight_loss.png',
+        ),
+        (
+            'Xc_model_pct',
+            'Xc',
+            'Remaining crystallinity (%)',
+            (0, 70),
+            's',
+            'ALL_GRADES_NIWA_crystallinity.png',
+        ),
+        (
+            'Degraded_fraction_pct',
+            None,
+            'Degraded fraction (%)',
+            None,
+            None,
+            'ALL_GRADES_NIWA_degraded_fraction.png',
+        ),
+        (
+            'pH_model',
+            'pH',
+            'Bath pH',
+            (3.8, 7.4),
+            'd',
+            'ALL_GRADES_NIWA_pH.png',
+        ),
+    ]
+
+    for model_col, obs_key, ylabel, ylim, marker, filename in settings:
+        # All grades use the same data-derived range for a fair comparison.
+        limits = (degraded_fraction_limits([results[g][model_col] for g in GRADES])
+                  if model_col == 'Degraded_fraction_pct' else ylim)
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(18, 5.6),
+            sharey=True,
+        )
+
+        for ax, grade in zip(axes, GRADES):
+            rec = results[grade]
+
+            if obs_key is not None:
+                ax.plot(
+                    T_EXP,
+                    DATA[grade][obs_key],
+                    marker=marker,
+                    linestyle='none',
+                    color='black',
+                    markersize=7.5,
+                    markerfacecolor='white',
+                    markeredgewidth=1.5,
+                    label=f'{grade} data',
+                    zorder=10,
+                )
+
+            tsm, ysm = smooth_curve(rec[model_col])
+
+            if model_col in (
+                'WL_model_pct',
+                'Xc_model_pct',
+            ):
+                ysm = np.clip(ysm, 0.0, 100.0)
+
+            ax.plot(
+                tsm,
+                ysm,
+                lw=3.2,
+                color=curve_colour(model_col),
+                label='NIWA',
+            )
+
+            ax.set_title(
+                grade,
+                fontsize=15,
+                fontweight='bold',
+            )
+
+            ax.set_xlabel(
+                'Time (h)',
+                fontsize=14,
+            )
+
+            ax.set_xlim(-0.5, 20.5)
+            ax.set_ylim(*limits)
+            ax.grid(alpha=0.25)
+
+            ax.tick_params(
+                axis='both',
+                labelsize=12,
+            )
+
+            ax.xaxis.set_major_locator(
+                MaxNLocator(integer=True)
+            )
+            if model_col == 'Degraded_fraction_pct':
+                style_degraded_fraction_axis(ax, rec[model_col], limits)
+                if ax is not axes[0]:
+                    ax.set_ylabel('')
+
+        axes[0].set_ylabel(
+            ylabel,
+            fontsize=14,
+        )
+
+        if model_col == 'Degraded_fraction_pct':
+            axes[0].set_ylabel('Degraded fraction (%)', fontsize=18, fontweight='bold')
+
+        handles, labels = axes[-1].get_legend_handles_labels()
+
+        fig.legend(
+            handles,
+            labels,
+            loc='lower center',
+            ncol=2,
+            bbox_to_anchor=(0.5, -0.01),
+            fontsize=11,
+            frameon=True,
+        )
+
+        fig.subplots_adjust(
+            left=0.07,
+            right=0.99,
+            top=0.92,
+            bottom=0.18,
+            wspace=0.10,
+        )
+
+        path = OVERVIEW_DIR / filename
+
+        savefig_windows_safe(
+            fig,
+            path,
+            dpi=600,
+            bbox_inches='tight',
+            facecolor='white',
+        )
+
+        plt.close(fig)
+
+
+# ================================================================
+# PARAMETER TABLE
+# ================================================================
+
+def build_parameter_table():
+    rows = []
+
+    for grade in GRADES:
+        p = PARAMS[grade]
+
+        rows.append(
+            dict(
+                Polymer=grade,
+                Model='NIWA',
+                k2=p['k2'],
+                k1=p['k1'],
+                kc=p['kc'],
+                ka=p['ka'],
+                km=p['km'],
+                ke=p['ke'],
+                De0=p['De0'],
+                alpha_pH=p['alpha'],
+            )
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ================================================================
+# MAIN
+# ================================================================
+
+def redraw_saved_curves():
+    """Regenerate grade and combined curve plots from existing simulation CSVs."""
+    results = {}
+    required = {'time_h', 'WL_model_pct', 'Xc_model_pct',
+                'Degraded_fraction_pct', 'pH_model', 'P_free'}
+    for grade in GRADES:
+        file = OUTPUT_ROOT / grade / f'{grade}_NIWA_model_timeseries.csv'
+        if not file.exists():
+            raise FileNotFoundError(
+                f'Missing saved results: {file}. Set REDRAW_CURVES_ONLY=False to simulate first.')
+        rec = pd.read_csv(file)
+        missing = required.difference(rec.columns)
+        if missing:
+            raise ValueError(f'{file.name}: missing columns {sorted(missing)}.')
+        if len(rec) != len(T_EXP) or not np.allclose(rec['time_h'], T_EXP):
+            raise ValueError(f'{file.name}: saved times do not match T_EXP.')
+        results[grade] = rec
+    for grade, rec in results.items():
+        save_grade_curves(grade, rec, OUTPUT_ROOT / grade)
+        vals = rec['Degraded_fraction_pct'].to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            print(f'{grade}: degraded fraction range = {vals.min():.6g} to {vals.max():.6g} %.')
+    save_all_grades_overview(results)
+    print('Saved curve plots redrawn; lattice simulations were not repeated.')
+
+
+def main():
+    start_all = time.time()
+
+    print('\n' + '=' * 100)
+    print('MA et al. PCL/CALB — NIWA SINGLE-D SPATIAL LATTICE MODEL')
+    print('NO INHIBITION / WITH AMORPHISATION')
+    print('NO CHAINS / NO DP / NO Mn-Mw-PDI / NO D1-D2 SPLITTING')
+    print('EXACT NIWA PDE-FITTED PARAMETERS; NO CA REFITTING')
+    print('=' * 100)
+
+    print(
+        f'Grid: {NX} x {NY}; '
+        f'physical domain: {LX:g} mm x {LY:g} mm; '
+        f'dx={DX:.8g} mm, dy={DY:.8g} mm'
+    )
+
+    print('Model: NIWA = No Inhibition With Amorphisation')
+    print('Degradation product: ZC/ZA -> single retained D; D -> P + V.')
+    print(f'Output folder: {OUTPUT_ROOT}')
+
+    parameter_df = build_parameter_table()
+
+    grid_metadata_df = pd.DataFrame([
+        dict(
+            Model='NIWA',
+            N_ROWS=N_ROWS,
+            NX=NX,
+            NY=NY,
+            LX_mm=LX,
+            LY_mm=LY,
+            DX_mm=DX,
+            DY_mm=DY,
+            Cell_area_mm2=CELL_AREA,
+            Physical_aspect_ratio=PHYSICAL_ASPECT_RATIO,
+            Cell_aspect_error=CELL_ASPECT_ERROR,
+            DT_h=DT,
+            T_END_h=T_END,
+            Initial_mass_per_cell=1.0,
+            State_sum_constraint='C+A+ZC+ZA+D+V=1',
+            Porosity_definition='phi=V',
+            Face_diffusivity='De0*max(phi_L,phi_R)',
+            Has_inhibition=False,
+            Has_amorphisation=True,
+            Molecular_weight_modelled=False,
+            Computational_chains_modelled=False,
+            Degradation_product_state='D',
+        )
+    ])
+
+    results = {}
+    all_snapshots = {}
+    summary_rows = []
+    curve_rows = []
+    init_rows = []
+
+    for grade_index, grade in enumerate(GRADES):
+        print('\n' + '-' * 100)
+        print(f'{grade} — NIWA')
+        print('-' * 100)
+
+        start = time.time()
+
+        outdir = OUTPUT_ROOT / grade
+        outdir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        seed = SEED0 + 1000 * grade_index
+
+        rec, snapshots = simulate(
+            grade,
+            seed,
+            save_snapshots=True,
+        )
+
+        elapsed = time.time() - start
+
+        results[grade] = rec
+        all_snapshots[grade] = snapshots
+
+        init_stats = rec.attrs.get(
+            'initialisation_stats',
+            {},
+        )
+
+        r2_wl = r2_score(
+            DATA[grade]['WL'],
+            rec['WL_model_pct'],
+        )
+
+        r2_xc = r2_score(
+            DATA[grade]['Xc'],
+            rec['Xc_model_pct'],
+        )
+
+        r2_ph = r2_score(
+            DATA[grade]['pH'],
+            rec['pH_model'],
+        )
+
+        summary_rows.append(
+            dict(
+                Polymer=grade,
+                Model='NIWA',
+                CA_R2_WL=r2_wl,
+                CA_R2_Xc=r2_xc,
+                CA_R2_pH=r2_ph,
+                Final_CA_WL_pct=float(
+                    rec['WL_model_pct'].iloc[-1]
+                ),
+                Final_CA_Xc_pct=float(
+                    rec['Xc_model_pct'].iloc[-1]
+                ),
+                Final_CA_degraded_fraction_pct=float(
+                    rec['Degraded_fraction_pct'].iloc[-1]
+                ),
+                Final_CA_pH=float(
+                    rec['pH_model'].iloc[-1]
+                ),
+                Final_P_free=float(
+                    rec['P_free'].iloc[-1]
+                ),
+                Max_cell_mass_balance_error=float(
+                    rec['max_cell_mass_error'].max()
+                ),
+                Runtime_s=elapsed,
+            )
+        )
+
+        init_rows.append(
+            dict(
+                Polymer=grade,
+                Model='NIWA',
+                **init_stats,
+            )
+        )
+
+        for _, row in rec.iterrows():
+            curve_rows.append(
+                dict(
+                    Polymer=grade,
+                    Model='NIWA',
+                    **row.to_dict(),
+                )
+            )
+
+        rec.to_csv(
+            outdir / f'{grade}_NIWA_model_timeseries.csv',
+            index=False,
+        )
+
+        pd.DataFrame([
+            dict(
+                Polymer=grade,
+                Model='NIWA',
+                **PARAMS[grade],
+            )
+        ]).to_csv(
+            outdir / f'{grade}_NIWA_PDE_parameters_used_unchanged.csv',
+            index=False,
+        )
+
+        save_grade_curves(
+            grade,
+            rec,
+            outdir,
+        )
+
+        save_phase_snapshot_evolution(
+            grade,
+            snapshots,
+            outdir,
+        )
+
+        save_enzyme_snapshot_evolution(
+            grade,
+            snapshots,
+            outdir,
+        )
+
+        # Per-grade centre-zoom morphology is intentionally not saved.
+        # A single combined three-grade morphology figure is created after
+        # all three simulations finish.
+
+        print(
+            f'completed in {elapsed:.1f} s | '
+            f'R2: WL={r2_wl:.4f}, '
+            f'Xc={r2_xc:.4f}, '
+            f'pH={r2_ph:.4f} | '
+            f'final WL={rec["WL_model_pct"].iloc[-1]:.2f}% | '
+            f'mass error={rec["max_cell_mass_error"].max():.3e}'
+        )
+
+    save_all_grades_overview(results)
+    save_all_grades_sem_center_zoom_comparison(all_snapshots)
+    save_all_grades_sem_center_zoom_bw_comparison(all_snapshots)
+
+    summary_df = pd.DataFrame(summary_rows)
+    curves_df = pd.DataFrame(curve_rows)
+    init_df = pd.DataFrame(init_rows)
+
+    summary_df.to_csv(
+        OUTPUT_ROOT / 'NIWA_CA_summary.csv',
+        index=False,
+    )
+
+    curves_df.to_csv(
+        OUTPUT_ROOT / 'NIWA_CA_timeseries.csv',
+        index=False,
+    )
+
+    init_df.to_csv(
+        OUTPUT_ROOT / 'NIWA_INITIAL_LATTICE_VALIDATION.csv',
+        index=False,
+    )
+
+    with pd.ExcelWriter(
+        OUTPUT_ROOT / 'NIWA_CA_results.xlsx'
+    ) as writer:
+        grid_metadata_df.to_excel(
+            writer,
+            sheet_name='Grid_and_model',
+            index=False,
+        )
+
+        parameter_df.to_excel(
+            writer,
+            sheet_name='NIWA_parameters',
+            index=False,
+        )
+
+        init_df.to_excel(
+            writer,
+            sheet_name='Initial_lattice',
+            index=False,
+        )
+
+        summary_df.to_excel(
+            writer,
+            sheet_name='CA_summary',
+            index=False,
+        )
+
+        curves_df.to_excel(
+            writer,
+            sheet_name='CA_timeseries',
+            index=False,
+        )
+
+    elapsed_all = time.time() - start_all
+
+    print('\n' + '=' * 100)
+    print('NIWA SIMULATIONS COMPLETED FOR ALL THREE PCL GRADES')
+    print('=' * 100)
+
+    print(
+        summary_df[
+            [
+                'Polymer',
+                'CA_R2_WL',
+                'CA_R2_Xc',
+                'CA_R2_pH',
+                'Final_CA_WL_pct',
+                'Final_CA_Xc_pct',
+                'Final_CA_pH',
+                'Max_cell_mass_balance_error',
+            ]
+        ].to_string(index=False)
+    )
+
+    print(f'\nTotal runtime: {elapsed_all:.1f} s')
+    print(f'Output folder: {OUTPUT_ROOT}')
+
+
+if __name__ == '__main__':
+    import sys
+    if REDRAW_CURVES_ONLY or '--curves-only' in sys.argv:
+        redraw_saved_curves()
+    else:
+        main()
+
+
+# ================================================================
+# PCL6300 POROSITY STUDY (NON-POROUS FILM AND POROUS SCAFFOLDS)
+# ================================================================
+# Single self-contained script: the NIWA CA above (random C/A assignment,
+# PDE parameters unchanged, E_T = 0.5) followed by the porosity study.
+# No other file is needed.
+
+import sys
+from scipy import ndimage
+from scipy.spatial import cKDTree
+
+g = sys.modules[__name__]           # the CA model defined above
+
+GRADE = 'PCL6300'
+POROSITIES = [0.0, 0.15, 0.30, 0.50]
+SEED = g.SEED0                      # same polymer morphology for every case
+PORE_SEED = g.SEED0 + 777           # same pore-placement stream for every case
+SNAP_TIMES = [0.0, 2.0, 4.0, 8.0, 12.0, 20.0]
+WINDOW_MM = 0.31                    # central window for the morphology panels
+SOLID_CUT = 0.01                    # connectivity analysis only
+PORE_GEOMETRY = 'walls'             # 'walls' or 'random'
+WALL_THICKNESS_MM = 0.018           # target wall thickness for 'walls' (about 2 cells at 0.010 mm)
+# Pore spacing grows with porosity so that the walls keep about the same
+# thickness: spacing = 2 * wall / (1 - V0). Higher porosity therefore means
+# larger pores separated by walls of similar thickness, as in scaffolds.
+
+OUT = g.BASE_DIR / f'MA_NIWA_PCL6300_POROSITY_STUDY_RANDOM_{PORE_GEOMETRY.upper()}'
+OUT.mkdir(parents=True, exist_ok=True)
+
+COLOURS = ['black', 'tab:blue', 'tab:orange', 'tab:green']
+
+
+def wall_architecture(cryst, xc0, n_pore):
+    """
+    Pores are the interiors of a random tessellation, so the polymer forms
+    continuous walls between pores. The crystalline/amorphous assignment of
+    the polymer cells is the random one of the non-porous lattice; randomly
+    chosen polymer cells are then switched between C and A until the
+    crystalline fraction of the remaining polymer is exactly xc0.
+    """
+    nx, ny = cryst.shape
+    rng = np.random.default_rng(PORE_SEED)
+    v0 = n_pore / float(nx * ny)
+    spacing = 2.0 * WALL_THICKNESS_MM / max(1.0 - v0, 1e-6) / g.DX
+    n_centres = max(2, int(round(nx * ny / spacing ** 2)))
+    centres = np.column_stack([rng.uniform(-0.5, nx - 0.5, n_centres),
+                               rng.uniform(-0.5, ny - 0.5, n_centres)])
+    pts = np.stack(np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij'),
+                   -1).reshape(-1, 2)
+    dist, _ = cKDTree(centres).query(pts, k=2)
+    d = 0.5 * (dist[:, 1] - dist[:, 0])
+    order = np.argsort(-d, kind='stable')
+    pores = order[:n_pore]
+    polymer = np.ones(nx * ny, dtype=bool)
+    polymer[pores] = False
+
+    c = cryst.ravel().copy()
+    target_c = int(round(xc0 * polymer.sum()))
+    r = np.random.default_rng(PORE_SEED + 1)
+    diff = int((c & polymer).sum()) - target_c
+    if diff > 0:         # too crystalline: random C cells become A
+        cand = np.flatnonzero(c & polymer)
+        c[r.choice(cand, size=diff, replace=False)] = False
+    elif diff < 0:       # too amorphous: random A cells become C
+        cand = np.flatnonzero(~c & polymer)
+        c[r.choice(cand, size=-diff, replace=False)] = True
+    return pores, c.reshape(nx, ny)
+
+
+def make_initialiser(v0):
+    """Return an initialise_lattice replacement with initial porosity v0."""
+
+    def initialise_porous(xc0, seed):
+        M, E, stats = g.initialise_lattice_base(xc0, seed)
+        if v0 <= 0.0:
+            return M, E, stats
+        n = g.NX * g.NY
+        n_pore = int(round(v0 * n))
+        if PORE_GEOMETRY == 'walls':
+            pores, cryst = wall_architecture(M[g.STATE_C] > 0.5, xc0, n_pore)
+            M[g.STATE_C] = cryst.astype(float)
+            M[g.STATE_A] = (~cryst).astype(float)
+        else:
+            n_pore_c = int(round(n_pore * xc0))
+            rng = np.random.default_rng(PORE_SEED)
+            c_cells = np.flatnonzero(M[g.STATE_C].ravel() > 0.5)
+            a_cells = np.flatnonzero(M[g.STATE_A].ravel() > 0.5)
+            pores = np.concatenate([
+                rng.choice(c_cells, n_pore_c, replace=False),
+                rng.choice(a_cells, n_pore - n_pore_c, replace=False),
+            ])
+        for s in range(g.N_STATES):
+            M[s].ravel()[pores] = 0.0
+        M[g.STATE_V].ravel()[pores] = 1.0
+        E.ravel()[pores] = g.E_T            # liquid-filled, enzyme present
+        stats = dict(stats, initial_pore_cells=int(n_pore),
+                     initial_porosity=v0)
+        return M, E, stats
+
+    return initialise_porous
+
+
+def polymer_connectivity(snap):
+    """Share of remaining polymer mass in the largest face-connected piece."""
+    solid = 1.0 - snap['mass_fractions'][:, :, g.STATE_V]
+    lab, n = ndimage.label(solid >= SOLID_CUT)
+    if n == 0:
+        return np.nan, 0
+    w = ndimage.sum(solid, lab, index=np.arange(1, n + 1))
+    return 100.0 * w.max() / solid.sum(), int(n)
+
+
+def crop(rgb):
+    ppm = rgb.shape[1] / g.LY
+    w = int(round(WINDOW_MM * ppm))
+    j0 = (rgb.shape[1] - w) // 2
+    return rgb[:, j0:j0 + w]
+
+
+def porosity_main():
+    g.initialise_lattice_base = g.initialise_lattice
+    saved_snap_steps = dict(g.SNAP_STEPS)
+    g.SNAP_STEPS = {int(round(t / g.DT)): float(t) for t in SNAP_TIMES}
+
+    results, snaps, rows = {}, {}, []
+    for v0 in POROSITIES:
+        g.initialise_lattice = make_initialiser(v0)
+        rec, sn = g.simulate(GRADE, SEED, save_snapshots=True)
+        v_frac0 = rec['V_pct'].iloc[0] / 100.0
+        rec['WL_porous_pct'] = (rec['V_pct'] / 100.0 - v_frac0) / (1.0 - v_frac0) * 100.0
+        results[v0], snaps[v0] = rec, sn
+        for t in SNAP_TIMES:
+            share, pieces = polymer_connectivity(sn[t])
+            rows.append(dict(initial_porosity=v0, time_h=t,
+                             largest_piece_pct=share, pieces=pieces))
+        print(f'V0 = {v0:.2f}: WL(8 h) = {np.interp(8, rec.time_h, rec.WL_porous_pct):.1f}%, '
+              f'WL(20 h) = {rec.WL_porous_pct.iloc[-1]:.1f}%, '
+              f'Xc(8 h) = {np.interp(8, rec.time_h, rec.Xc_model_pct):.1f}%', flush=True)
+    g.initialise_lattice = g.initialise_lattice_base
+    g.SNAP_STEPS = saved_snap_steps
+
+    pd.concat([r.assign(initial_porosity=v) for v, r in results.items()]).to_csv(
+        OUT / 'PCL6300_POROSITY_COMPARISON_timeseries.csv', index=False)
+    conn = pd.DataFrame(rows)
+    conn.to_csv(OUT / 'PCL6300_POROSITY_polymer_connectivity.csv', index=False)
+
+    # Curves (no titles; information in legends).
+    for col, key, ylabel, ylim, name, marker in (
+            ('WL_porous_pct', 'WL', 'Weight loss (%)', (0, 100), 'weight_loss', 'o'),
+            ('Xc_model_pct', 'Xc', 'Crystallinity (%)', (0, 70), 'crystallinity', 's')):
+        fig, ax = plt.subplots(figsize=(8, 5.5))
+        ax.plot(g.T_EXP, g.DATA[GRADE][key], marker=marker, linestyle='none',
+                color='black', ms=9, markerfacecolor='white', markeredgewidth=1.6,
+                zorder=10, label='PCL6300 data (film)')
+        for (v0, rec), colr in zip(results.items(), COLOURS):
+            t, y = g.smooth_curve(rec[col])
+            ax.plot(t, np.clip(y, 0, 100), lw=3, color=colr,
+                    label=f'{100 * v0:g}%')
+        ax.set(xlabel='Time (h)', ylabel=ylabel, xlim=(-0.5, 20.5), ylim=ylim)
+        ax.grid(alpha=0.3)
+        ax.legend(title='Initial porosity', fontsize=10, title_fontsize=11)
+        fig.tight_layout()
+        g.savefig_windows_safe(fig, OUT / f'PCL6300_POROSITY_COMPARISON_{name}.png', dpi=600)
+        plt.close(fig)
+
+    legend = list(g.PHASE_LEGEND)       # one unique colour per species
+
+    # Initial morphology, full width, one row per porosity.
+    fig, axes = plt.subplots(1, len(POROSITIES), figsize=(16, 3.4))
+    for ax, v0 in zip(axes, POROSITIES):
+        rgb = crop(g.fraction_preserving_phase_image(snaps[v0][0.0]))
+        ax.imshow(rgb, interpolation='nearest', aspect='equal')
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel(f'{100 * v0:g}%', fontsize=13, fontweight='bold')
+    fig.legend(handles=legend, loc='lower center', ncol=6, fontsize=11)
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
+    g.savefig_windows_safe(fig, OUT / 'PCL6300_INITIAL_MORPHOLOGY_ALL_POROSITIES.png', dpi=300)
+    plt.close(fig)
+
+    # Morphology evolution: rows = times, columns = porosities.
+    fig, axes = plt.subplots(len(SNAP_TIMES), len(POROSITIES),
+                             figsize=(14, 2.3 * len(SNAP_TIMES) + 1), squeeze=False)
+    for r, t in enumerate(SNAP_TIMES):
+        for c, v0 in enumerate(POROSITIES):
+            ax = axes[r, c]
+            ax.imshow(crop(g.fraction_preserving_phase_image(snaps[v0][t])),
+                      interpolation='nearest', aspect='equal')
+            ax.set_xticks([]); ax.set_yticks([])
+            if r == len(SNAP_TIMES) - 1:
+                ax.set_xlabel(f'{100 * v0:g}%', fontsize=13, fontweight='bold')
+            if c == 0:
+                ax.set_ylabel(f'{t:g} h', fontsize=13, fontweight='bold',
+                              rotation=0, ha='right', va='center')
+    fig.legend(handles=legend, loc='lower center', ncol=6, fontsize=12)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    g.savefig_windows_safe(fig, OUT / 'PCL6300_ZOOMED_MORPHOLOGY_ALL_SPECIMENS_PANEL.png', dpi=300)
+    plt.close(fig)
+
+    # Full-specimen morphology evolution: one figure per initial porosity,
+    # rows = times, each panel the whole 0.30 mm x 10 mm cross-section.
+    for v0 in POROSITIES:
+        fig, axes = plt.subplots(len(SNAP_TIMES), 1,
+                                 figsize=(22, 2.0 * len(SNAP_TIMES) + 1.5),
+                                 squeeze=False)
+        for r, t in enumerate(SNAP_TIMES):
+            ax = axes[r, 0]
+            ax.imshow(g.fraction_preserving_phase_image(snaps[v0][t]),
+                      extent=[0.0, g.LY, g.LX, 0.0], origin='upper',
+                      interpolation='nearest', aspect='auto')
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.text(-0.012, 0.5, f't = {t:g} h', transform=ax.transAxes,
+                    ha='right', va='center', fontsize=16, fontweight='bold')
+        fig.legend(handles=legend + [Patch(facecolor='none', edgecolor='none',
+                   label=f'initial porosity {100 * v0:g}%')],
+                   loc='lower center', ncol=7, fontsize=13)
+        fig.subplots_adjust(left=0.08, right=0.99, top=0.98, bottom=0.10,
+                            hspace=0.12)
+        g.savefig_windows_safe(
+            fig, OUT / f'PCL6300_FULL_MORPHOLOGY_porosity_{int(round(100 * v0)):02d}.png',
+            dpi=300)
+        plt.close(fig)
+
+    # Combined full-specimen morphology: for each time, one strip per initial
+    # porosity, each strip the whole 0.30 mm x 10 mm cross-section drawn to
+    # scale.
+    full_times = [0.0, 2.0, 4.0, 8.0, 20.0]
+    n_rows = len(full_times) * len(POROSITIES)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(16, 0.62 * n_rows + 1.2),
+                             squeeze=False)
+    for a, t in enumerate(full_times):
+        for b, v0 in enumerate(POROSITIES):
+            ax = axes[a * len(POROSITIES) + b, 0]
+            ax.imshow(g.fraction_preserving_phase_image(snaps[v0][t]),
+                      extent=[0.0, g.LY, g.LX, 0.0], origin='upper',
+                      interpolation='nearest', aspect='equal')
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.text(-0.005, 0.5, f'{100 * v0:g}%', transform=ax.transAxes,
+                    ha='right', va='center', fontsize=10)
+            if b == 0:
+                ax.text(-0.055, -1.5, f'{t:g} h', transform=ax.transAxes,
+                        ha='right', va='center', fontsize=13,
+                        fontweight='bold')
+    fig.legend(handles=legend, loc='lower center', ncol=6, fontsize=12)
+    fig.subplots_adjust(left=0.08, right=0.995, top=0.995, bottom=0.06,
+                        hspace=0.35)
+    g.savefig_windows_safe(fig, OUT / 'PCL6300_FULL_MORPHOLOGY_ALL_POROSITIES.png',
+                           dpi=300)
+    plt.close(fig)
+
+    print(conn[conn.time_h.isin([0.0, 12.0])].round(2).to_string(index=False))
+    print(f'Output folder: {OUT}')
+
+
+if __name__ == '__main__':
+    porosity_main()
