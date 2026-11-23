@@ -1,0 +1,1184 @@
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from numba import njit
+
+
+# ============================================================================
+# MA et al. PCL/CALB
+# NIWA SINGLE-D SPATIAL LATTICE: THICKNESS STUDY
+# ============================================================================
+#
+# NIWA mechanism (unchanged):
+#
+#   E + C  --k2--> ZC
+#   ZC     --kc--> E + D
+#   ZC     --km--> E + A
+#   E + A  --k1--> ZA
+#   ZA     --ka--> E + D
+#   D      --ke--> P + V
+#
+# Local state constraint:   C + A + ZC + ZA + D + V = 1
+# Local porosity:           phi = V
+# Face diffusivity:         D_E,f = De0 * max(phi_L, phi_R)
+#
+# Each grade uses its own fitted NIWA PDE parameters and initial
+# crystallinity, transferred unchanged to every thickness. No refitting.
+#
+# Geometry convention
+# -------------------
+# Full specimen: 30 mm x 10 mm x thickness. The CA resolves the 2-D
+# cross-section thickness (x) x 10 mm width (y). The 30 mm length is
+# out-of-plane.
+#
+# Changes relative to the previous version of this study
+# ------------------------------------------------------
+# 1) Grid: reference lattice is REF_NX = 30 rows across 0.30 mm
+#    (0.010 mm cells), matching the Chapter 7 CA. The physical cell size is
+#    held fixed, so thickness, not resolution, is the controlled variable.
+#
+# 2) Exposure: by default enzyme is prescribed on the two film faces only
+#    (x = 0 and x = thickness) with zero flux at the 10 mm edges
+#    (EXPOSE_EDGES = False). This isolates through-thickness erosion; with
+#    all four sides exposed, edge attack grows with thickness and confounds
+#    the comparison. Set EXPOSE_EDGES = True to recover the Ch7 boundary
+#    condition.
+#
+# 3) Simulation time is T_END = 20 h for every thickness, the duration of
+#    the Ma et al. experiment. The parameters were calibrated on 0 to 20 h,
+#    so no case is extrapolated in time. t25/t50/t75 are reported only where
+#    they are reached within 20 h (NaN otherwise).
+#
+# 4) pH is mass-consistent. The bath volume is the experimental one, so the
+#    released product is scaled by the film mass relative to the 0.30 mm
+#    reference film:
+#        P_bath = (released mass fraction) * (h / REF_THICKNESS)
+#    The linear pH law pH = pH0 - alpha * P_bath was calibrated only for
+#    P_bath up to about one reference film; beyond PH_VALID_P_MAX the pH is
+#    reported as NaN instead of being extrapolated.
+#
+# 5) New output: eroded depth per face, d(t) = (WL/100) * h / 2, and the
+#    erosion-front velocity (slope of d(t) over the fixed window 1 to 8 h,
+#    the same for every thickness). For a surface-erosion model d(t) should
+#    collapse across thicknesses until the fronts approach the mid-plane.
+#
+# 6) Plots have no titles; grade and thickness information is in the
+#    legend and file names.
+#
+# Stochasticity enters only through the random initial C/A morphology; the
+# lattice update itself is deterministic (expected fractional masses).
+# ============================================================================
+
+
+# ============================================================================
+# 1) FIXED MODEL / MATERIAL SETTINGS
+# ============================================================================
+
+MODEL_NAME = 'NIWA'
+MODEL_DESCRIPTION = 'No Inhibition With Amorphisation'
+
+GRADES = ['PCL6300', 'PCL6500', 'PCL6800']
+
+PH0 = 7.2
+E_T = 0.5
+
+# Global NIWA estimates from the PDE chapter (Table tab:PCL_IWA_NIWA), rounded to
+# two significant figures, the same values as in the Chapter 7 CA script.
+GRADE_SETTINGS = {
+    'PCL6300': dict(
+        XC0=0.65,
+        k2=50.0,
+        k1=16.0,
+        kc=2.1,
+        ka=7.4e-02,
+        km=5.9e-08,
+        ke=50.0,
+        De0=3.2e-03,
+        alpha=3.4,
+    ),
+    'PCL6500': dict(
+        XC0=0.6,
+        k2=2.7,
+        k1=50.0,
+        kc=50.0,
+        ka=7.3e-02,
+        km=4.5e-06,
+        ke=50.0,
+        De0=7.9e-03,
+        alpha=3.1,
+    ),
+    'PCL6800': dict(
+        XC0=0.6,
+        k2=5.5,
+        k1=50.0,
+        kc=50.0,
+        ka=8.8e-02,
+        km=1.2e-06,
+        ke=50.0,
+        De0=4.6e-03,
+        alpha=3.2,
+    ),
+}
+
+DT = 0.005
+
+# Simulation length: the experimental duration, identical for all thicknesses.
+T_END = 20.0
+N_RECORD = 101
+
+# Fixed comparison time (the experimental horizon) reported for every case.
+T_COMPARE = 20.0
+
+# pH law validity: linear pH law is not extrapolated beyond this amount of
+# released product (in units of one reference-film mass).
+PH_VALID_P_MAX = 1.0
+
+SEED0 = 20260831
+N_REP = 3
+
+
+def seeds_for_grade(grade):
+    """Deterministic, non-overlapping replicate seeds for each grade."""
+    grade_index = GRADES.index(grade)
+    return [SEED0 + 1000 * grade_index + r for r in range(N_REP)]
+
+
+# ============================================================================
+# 2) REFERENCE GEOMETRY AND PHYSICAL GRID RESOLUTION
+# ============================================================================
+
+OUT_OF_PLANE_LENGTH_MM = 30.0
+IN_PLANE_WIDTH_MM = 10.0
+
+REF_THICKNESS_MM = 0.30
+REF_NX = 30
+
+TARGET_CELL_MM = REF_THICKNESS_MM / REF_NX  # 0.010 mm
+
+# Thicknesses kept at or below 2 mm so the section remains film-like
+# (width / thickness >= 5).
+THICKNESSES_MM = [0.30, 0.50, 1.00, 2.00]
+
+# Enzyme exposure at the 10 mm edges (see header, item 2).
+EXPOSE_EDGES = False
+
+
+RECORD_TIMES = np.linspace(0.0, T_END, N_RECORD)
+
+
+# ============================================================================
+# 3) MATERIAL STATE CODES
+# ============================================================================
+
+STATE_C = 0
+STATE_A = 1
+STATE_ZC = 2
+STATE_ZA = 3
+STATE_D = 4
+STATE_V = 5
+N_STATES = 6
+
+STATE_NAMES = ['C', 'A', 'ZC', 'ZA', 'D', 'V']
+
+
+# ============================================================================
+# 4) OUTPUT DIRECTORY
+# ============================================================================
+
+try:
+    BASE_DIR = Path.home() / 'Downloads'
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    BASE_DIR = Path.cwd()
+
+OUTPUT_DIR = BASE_DIR / 'ALL_PCL_GRADES_NIWA_CA_THICKNESS_STUDY'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print(f'Results will be saved in: {OUTPUT_DIR}')
+
+
+# ============================================================================
+# 5) GEOMETRY -> GRID CONVERSION
+# ============================================================================
+
+def geometry_to_grid(thickness_mm, width_mm=IN_PLANE_WIDTH_MM):
+    """
+    Convert physical geometry to a lattice with approximately the reference
+    physical cell size. Thickness is x (NX cells); the 10 mm width is y.
+    """
+    thickness_mm = float(thickness_mm)
+    width_mm = float(width_mm)
+
+    if thickness_mm <= 0.0 or width_mm <= 0.0:
+        raise ValueError('Physical dimensions must be positive.')
+
+    nx = max(3, int(round(thickness_mm / TARGET_CELL_MM)))
+    ny = max(3, int(round(width_mm / TARGET_CELL_MM)))
+
+    dx = thickness_mm / nx
+    dy = width_mm / ny
+
+    return dict(
+        thickness_mm=thickness_mm,
+        width_mm=width_mm,
+        nx=nx,
+        ny=ny,
+        dx=dx,
+        dy=dy,
+        cell_area=dx * dy,
+        cell_aspect_error=abs(dx - dy) / dx,
+        total_cells=nx * ny,
+        mass_ratio_to_ref=thickness_mm / REF_THICKNESS_MM,
+    )
+
+
+# ============================================================================
+# 6) INITIALISATION
+# ============================================================================
+
+def apply_enzyme_bc(E, expose_edges):
+    E[0, :] = E_T
+    E[-1, :] = E_T
+    if expose_edges:
+        E[:, 0] = E_T
+        E[:, -1] = E_T
+
+
+def initialise_lattice(nx, ny, xc0, seed):
+    """
+    Spatially random C/A morphology with exactly round(xc0*N) crystalline
+    cells. Each cell starts with one normalised unit of material.
+    """
+    rng = np.random.default_rng(int(seed))
+
+    n_cells = int(nx * ny)
+    n_c = int(round(float(xc0) * n_cells))
+
+    phase = np.zeros(n_cells, dtype=np.uint8)
+    phase[:n_c] = 1
+    rng.shuffle(phase)
+    phase = phase.reshape(nx, ny)
+
+    M = np.zeros((N_STATES, nx, ny), dtype=np.float64)
+    M[STATE_C, :, :] = (phase == 1)
+    M[STATE_A, :, :] = (phase == 0)
+
+    E = np.zeros((nx, ny), dtype=np.float64)
+    apply_enzyme_bc(E, EXPOSE_EDGES)
+
+    return M, E
+
+
+# ============================================================================
+# 7) REACTION HALF-STEP
+# ============================================================================
+
+@njit(cache=False)
+def reaction_half_step(M, E, k2, kc, km, k1, ka, ke, dt, ET, expose_edges):
+    """
+    NIWA reaction network over one Strang reaction half-step.
+
+    Eligibility is based on masses present at the START of the half-step:
+      * newly generated D cannot erode in that same half-step;
+      * newly generated A cannot bind in that same half-step;
+      * newly generated ZC/ZA cannot turn over in that same half-step.
+    """
+    nx = M.shape[1]
+    ny = M.shape[2]
+
+    kc_total = kc + km
+    p_leave_c = 1.0 - np.exp(-kc_total * dt) if kc_total > 0.0 else 0.0
+    branch_d = kc / kc_total if kc_total > 0.0 else 1.0
+
+    p_leave_a = 1.0 - np.exp(-ka * dt) if ka > 0.0 else 0.0
+    p_erode = 1.0 - np.exp(-ke * dt) if ke > 0.0 else 0.0
+
+    released_mass = 0.0
+
+    for i in range(nx):
+        for j in range(ny):
+            c0 = M[STATE_C, i, j]
+            a0 = M[STATE_A, i, j]
+            zc0 = M[STATE_ZC, i, j]
+            za0 = M[STATE_ZA, i, j]
+            d0 = M[STATE_D, i, j]
+            v0 = M[STATE_V, i, j]
+
+            e0 = E[i, j]
+            if e0 < 0.0:
+                e0 = 0.0
+
+            p_attack_c = 1.0 - np.exp(-k2 * e0 * dt) if k2 > 0.0 else 0.0
+            p_attack_a = 1.0 - np.exp(-k1 * e0 * dt) if k1 > 0.0 else 0.0
+
+            # 1) Existing degraded polymer erodes: D -> P + V
+            erode = d0 * p_erode
+            d = d0 - erode
+            v = v0 + erode
+            released_mass += erode
+
+            # 2) Existing amorphous complex degrades: ZA -> E + D
+            za_to_d = za0 * p_leave_a
+            za = za0 - za_to_d
+            d += za_to_d
+
+            # 3) Existing amorphous polymer binds enzyme: E + A -> ZA
+            a_to_za = a0 * p_attack_a
+            a = a0 - a_to_za
+            za += a_to_za
+
+            # 4) Existing crystalline complex: ZC -> E + D or E + A
+            zc_leave = zc0 * p_leave_c
+            zc_to_d = zc_leave * branch_d
+            zc_to_a = zc_leave - zc_to_d
+
+            zc = zc0 - zc_leave
+            d += zc_to_d
+            a += zc_to_a
+
+            # 5) Existing crystalline polymer binds enzyme: E + C -> ZC
+            c_to_zc = c0 * p_attack_c
+            c = c0 - c_to_zc
+            zc += c_to_zc
+
+            # Free active enzyme bookkeeping.
+            e_poly = e0 - c_to_zc - a_to_za + zc_leave + za_to_d
+            if e_poly < 0.0:
+                e_poly = 0.0
+
+            M[STATE_C, i, j] = c
+            M[STATE_A, i, j] = a
+            M[STATE_ZC, i, j] = zc
+            M[STATE_ZA, i, j] = za
+            M[STATE_D, i, j] = d
+            M[STATE_V, i, j] = v
+            E[i, j] = e_poly
+
+    # Dirichlet active-enzyme boundary condition on the exposed surfaces.
+    for j in range(ny):
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+    if expose_edges:
+        for i in range(nx):
+            E[i, 0] = ET
+            E[i, ny - 1] = ET
+
+    total_initial_mass = float(nx * ny)
+    return released_mass / total_initial_mass
+
+
+# ============================================================================
+# 8) POROSITY-DEPENDENT ENZYME TRANSPORT
+# ============================================================================
+
+@njit(cache=False)
+def fill_porosity(phi, M):
+    """Local porosity is exactly the local void fraction V."""
+    nx = phi.shape[0]
+    ny = phi.shape[1]
+
+    for i in range(nx):
+        for j in range(ny):
+            value = M[STATE_V, i, j]
+
+            if value < 0.0:
+                value = 0.0
+            elif value > 1.0:
+                value = 1.0
+
+            phi[i, j] = value
+
+
+@njit(cache=False)
+def diffuse_x(E, phi, De0, dt, dx, ET):
+    """Implicit diffusion through the thickness; Dirichlet at both faces."""
+    nx, ny = E.shape
+    m = nx - 2
+
+    a = np.empty(m)
+    b = np.empty(m)
+    c = np.empty(m)
+    d = np.empty(m)
+    cp = np.empty(m)
+    rhs_p = np.empty(m)
+    sol = np.empty(m)
+
+    inv = 1.0 / (dx * dx)
+
+    for j in range(ny):
+        for q in range(m):
+            i = q + 1
+
+            Dl = De0 * max(phi[i - 1, j], phi[i, j])
+            Dr = De0 * max(phi[i, j], phi[i + 1, j])
+
+            ll = dt * Dl * inv
+            lr = dt * Dr * inv
+
+            a[q] = -ll
+            b[q] = 1.0 + ll + lr
+            c[q] = -lr
+            d[q] = E[i, j]
+
+        d[0] -= a[0] * ET
+        a[0] = 0.0
+
+        d[m - 1] -= c[m - 1] * ET
+        c[m - 1] = 0.0
+
+        cp[0] = c[0] / b[0]
+        rhs_p[0] = d[0] / b[0]
+
+        for q in range(1, m):
+            den = b[q] - a[q] * cp[q - 1]
+
+            if q < m - 1:
+                cp[q] = c[q] / den
+
+            rhs_p[q] = (d[q] - a[q] * rhs_p[q - 1]) / den
+
+        sol[m - 1] = rhs_p[m - 1]
+
+        for q in range(m - 2, -1, -1):
+            sol[q] = rhs_p[q] - cp[q] * sol[q + 1]
+
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+        for q in range(m):
+            E[q + 1, j] = sol[q]
+
+
+@njit(cache=False)
+def diffuse_y_dirichlet(E, phi, De0, dt, dy, ET):
+    """Implicit diffusion across the 10 mm width; edges exposed (E = E_T)."""
+    nx, ny = E.shape
+    m = ny - 2
+
+    a = np.empty(m)
+    b = np.empty(m)
+    c = np.empty(m)
+    d = np.empty(m)
+    cp = np.empty(m)
+    rhs_p = np.empty(m)
+    sol = np.empty(m)
+
+    inv = 1.0 / (dy * dy)
+
+    for i in range(1, nx - 1):
+        for q in range(m):
+            j = q + 1
+
+            Dl = De0 * max(phi[i, j - 1], phi[i, j])
+            Dr = De0 * max(phi[i, j], phi[i, j + 1])
+
+            ll = dt * Dl * inv
+            lr = dt * Dr * inv
+
+            a[q] = -ll
+            b[q] = 1.0 + ll + lr
+            c[q] = -lr
+            d[q] = E[i, j]
+
+        d[0] -= a[0] * ET
+        a[0] = 0.0
+
+        d[m - 1] -= c[m - 1] * ET
+        c[m - 1] = 0.0
+
+        cp[0] = c[0] / b[0]
+        rhs_p[0] = d[0] / b[0]
+
+        for q in range(1, m):
+            den = b[q] - a[q] * cp[q - 1]
+
+            if q < m - 1:
+                cp[q] = c[q] / den
+
+            rhs_p[q] = (d[q] - a[q] * rhs_p[q - 1]) / den
+
+        sol[m - 1] = rhs_p[m - 1]
+
+        for q in range(m - 2, -1, -1):
+            sol[q] = rhs_p[q] - cp[q] * sol[q + 1]
+
+        E[i, 0] = ET
+        E[i, ny - 1] = ET
+
+        for q in range(m):
+            E[i, q + 1] = sol[q]
+
+    for j in range(ny):
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+    for i in range(nx):
+        E[i, 0] = ET
+        E[i, ny - 1] = ET
+
+
+@njit(cache=False)
+def diffuse_y_noflux(E, phi, De0, dt, dy, ET):
+    """
+    Implicit diffusion across the 10 mm width with zero flux at both edges.
+    All ny cells are unknowns; the face rows x = 0 and x = nx-1 stay at E_T.
+    """
+    nx, ny = E.shape
+    m = ny
+
+    a = np.empty(m)
+    b = np.empty(m)
+    c = np.empty(m)
+    d = np.empty(m)
+    cp = np.empty(m)
+    rhs_p = np.empty(m)
+    sol = np.empty(m)
+
+    inv = 1.0 / (dy * dy)
+
+    for i in range(1, nx - 1):
+        for j in range(m):
+            if j > 0:
+                Dl = De0 * max(phi[i, j - 1], phi[i, j])
+            else:
+                Dl = 0.0
+
+            if j < m - 1:
+                Dr = De0 * max(phi[i, j], phi[i, j + 1])
+            else:
+                Dr = 0.0
+
+            ll = dt * Dl * inv
+            lr = dt * Dr * inv
+
+            a[j] = -ll
+            b[j] = 1.0 + ll + lr
+            c[j] = -lr
+            d[j] = E[i, j]
+
+        cp[0] = c[0] / b[0]
+        rhs_p[0] = d[0] / b[0]
+
+        for q in range(1, m):
+            den = b[q] - a[q] * cp[q - 1]
+
+            if q < m - 1:
+                cp[q] = c[q] / den
+
+            rhs_p[q] = (d[q] - a[q] * rhs_p[q - 1]) / den
+
+        sol[m - 1] = rhs_p[m - 1]
+
+        for q in range(m - 2, -1, -1):
+            sol[q] = rhs_p[q] - cp[q] * sol[q + 1]
+
+        for q in range(m):
+            E[i, q] = sol[q]
+
+    for j in range(ny):
+        E[0, j] = ET
+        E[nx - 1, j] = ET
+
+
+# ============================================================================
+# 9) OBSERVABLES
+# ============================================================================
+
+def observables(M, E, released_fraction, alpha, mass_ratio, thickness_mm):
+    masses = np.sum(M, axis=(1, 2))
+
+    nC = float(masses[STATE_C])
+    nA = float(masses[STATE_A])
+    nZC = float(masses[STATE_ZC])
+    nZA = float(masses[STATE_ZA])
+    nD = float(masses[STATE_D])
+    nV = float(masses[STATE_V])
+
+    nx = M.shape[1]
+    ny = M.shape[2]
+    total_initial_mass = float(nx * ny)
+    solid = nC + nA + nZC + nZA + nD
+
+    wl = 100.0 * nV / total_initial_mass
+    xc = 100.0 * (nC + nZC) / solid if solid > 0.0 else 0.0
+    degraded_fraction = 100.0 * nD / solid if solid > 0.0 else 0.0
+
+    # Product in the fixed-volume bath, in units of one reference-film mass.
+    p_bath = released_fraction * mass_ratio
+    if p_bath <= PH_VALID_P_MAX:
+        ph = PH0 - alpha * p_bath
+    else:
+        ph = np.nan
+
+    # Eroded depth per exposed face (faces-only exposure: two faces).
+    eroded_depth_mm = (wl / 100.0) * thickness_mm / 2.0
+
+    cell_sum = np.sum(M, axis=0)
+    max_mass_error = float(np.max(np.abs(cell_sum - 1.0)))
+
+    return dict(
+        WL=wl,
+        Xc=xc,
+        Degraded_fraction=degraded_fraction,
+        pH=ph,
+        P_bath=float(p_bath),
+        Eroded_depth_mm=eroded_depth_mm,
+        C_pct=100.0 * nC / total_initial_mass,
+        A_pct=100.0 * nA / total_initial_mass,
+        ZC_pct=100.0 * nZC / total_initial_mass,
+        ZA_pct=100.0 * nZA / total_initial_mass,
+        D_pct=100.0 * nD / total_initial_mass,
+        V_pct=100.0 * nV / total_initial_mass,
+        E_mean=float(np.mean(E)),
+        max_cell_mass_error=max_mass_error,
+    )
+
+
+# ============================================================================
+# 10) ONE THICKNESS / ONE INITIAL-MORPHOLOGY REPLICATE
+# ============================================================================
+
+COLUMNS = [
+    'time_h',
+    'WL_model_pct',
+    'Xc_model_pct',
+    'Degraded_fraction_pct',
+    'pH_model',
+    'P_bath',
+    'Eroded_depth_mm',
+    'C_pct',
+    'A_pct',
+    'ZC_pct',
+    'ZA_pct',
+    'D_pct',
+    'V_pct',
+    'E_mean',
+    'max_cell_mass_error',
+]
+
+
+def simulate_one_geometry(grade, thickness_mm, seed, record_times=None):
+    settings = GRADE_SETTINGS[grade]
+    geom = geometry_to_grid(thickness_mm)
+
+    if record_times is None:
+        record_times = RECORD_TIMES
+
+    nx = geom['nx']
+    ny = geom['ny']
+    dx = geom['dx']
+    dy = geom['dy']
+    mass_ratio = geom['mass_ratio_to_ref']
+
+    M, E = initialise_lattice(nx, ny, settings['XC0'], seed)
+    phi = np.zeros((nx, ny), dtype=np.float64)
+
+    released_fraction = 0.0
+
+    record_times = np.asarray(record_times, dtype=float)
+    record_steps = np.rint(record_times / DT).astype(np.int64)
+    nsteps = int(round(float(np.max(record_times)) / DT))
+
+    rec = np.zeros((len(record_times), len(COLUMNS)), dtype=float)
+    record_lookup = {int(step): idx for idx, step in enumerate(record_steps)}
+
+    for step in range(nsteps + 1):
+        if step in record_lookup:
+            idx = record_lookup[step]
+            vals = observables(
+                M, E, released_fraction, settings['alpha'],
+                mass_ratio, geom['thickness_mm'],
+            )
+
+            rec[idx, :] = [
+                step * DT,
+                vals['WL'],
+                vals['Xc'],
+                vals['Degraded_fraction'],
+                vals['pH'],
+                vals['P_bath'],
+                vals['Eroded_depth_mm'],
+                vals['C_pct'],
+                vals['A_pct'],
+                vals['ZC_pct'],
+                vals['ZA_pct'],
+                vals['D_pct'],
+                vals['V_pct'],
+                vals['E_mean'],
+                vals['max_cell_mass_error'],
+            ]
+
+        if step == nsteps:
+            break
+
+        # Strang splitting: reaction half -> diffusion full -> reaction half.
+        released_1 = reaction_half_step(
+            M, E,
+            settings['k2'], settings['kc'], settings['km'],
+            settings['k1'], settings['ka'], settings['ke'],
+            DT / 2.0, E_T, EXPOSE_EDGES,
+        )
+        released_fraction = max(released_fraction + released_1, 0.0)
+
+        fill_porosity(phi, M)
+
+        diffuse_x(E, phi, settings['De0'], DT, dx, E_T)
+
+        if EXPOSE_EDGES:
+            diffuse_y_dirichlet(E, phi, settings['De0'], DT, dy, E_T)
+        else:
+            diffuse_y_noflux(E, phi, settings['De0'], DT, dy, E_T)
+
+        released_2 = reaction_half_step(
+            M, E,
+            settings['k2'], settings['kc'], settings['km'],
+            settings['k1'], settings['ka'], settings['ke'],
+            DT / 2.0, E_T, EXPOSE_EDGES,
+        )
+        released_fraction = max(released_fraction + released_2, 0.0)
+
+    return pd.DataFrame(rec, columns=COLUMNS), geom
+
+
+# ============================================================================
+# 11) REPLICATE AGGREGATION
+# ============================================================================
+
+def simulate_geometry_case(grade, thickness_mm):
+    runs = []
+    runtimes = []
+    geom = None
+    seeds = seeds_for_grade(grade)
+    record_times = RECORD_TIMES
+
+    for rep, seed in enumerate(seeds, start=1):
+        print(f'    replicate {rep}/{N_REP}, seed={seed}')
+        t0 = time.time()
+
+        rec, geom = simulate_one_geometry(
+            grade=grade,
+            thickness_mm=thickness_mm,
+            seed=seed,
+            record_times=record_times,
+        )
+
+        runtimes.append(time.time() - t0)
+        runs.append(rec)
+
+    metric_columns = [c for c in COLUMNS if c != 'time_h']
+
+    out = pd.DataFrame({'time_h': record_times})
+    ddof = 1 if N_REP > 1 else 0
+
+    for col in metric_columns:
+        arr = np.vstack([run[col].to_numpy(dtype=float) for run in runs])
+        out[f'{col}_mean'] = np.mean(arr, axis=0)
+        out[f'{col}_sd'] = np.std(arr, axis=0, ddof=ddof)
+
+    out.attrs['grade'] = grade
+    out.attrs['geometry'] = geom
+    out.attrs['mean_runtime_s'] = float(np.mean(runtimes))
+    out.attrs['total_runtime_s'] = float(np.sum(runtimes))
+
+    return out
+
+
+# ============================================================================
+# 12) SUMMARY METRICS
+# ============================================================================
+
+def time_to_threshold(time_h, y_pct, threshold_pct):
+    t = np.asarray(time_h, dtype=float)
+    y = np.asarray(y_pct, dtype=float)
+
+    idx = np.flatnonzero(y >= float(threshold_pct))
+    if idx.size == 0:
+        return np.nan
+
+    k = int(idx[0])
+    if k == 0:
+        return float(t[0])
+
+    t0, t1 = t[k - 1], t[k]
+    y0, y1 = y[k - 1], y[k]
+
+    if y1 == y0:
+        return float(t1)
+
+    return float(t0 + (threshold_pct - y0) * (t1 - t0) / (y1 - y0))
+
+
+def value_at_time(time_h, y, t_query):
+    t = np.asarray(time_h, dtype=float)
+    if t_query > t[-1]:
+        return np.nan
+    return float(np.interp(t_query, t, np.asarray(y, dtype=float)))
+
+
+def front_velocity(time_h, depth_mm, t_lo=1.0, t_hi=8.0):
+    """
+    Erosion-front velocity (mm/h per face): least-squares slope of eroded
+    depth against time over a FIXED time window [t_lo, t_hi], identical for
+    every thickness. The window starts after the initial start-up transient
+    and ends before the fronts meet at the mid-plane of the thinnest film
+    (about 9 h for 0.3 mm), so all thicknesses are compared over the same
+    interval and any difference reflects thickness, not the fitting window.
+    """
+    t = np.asarray(time_h, dtype=float)
+    dep = np.asarray(depth_mm, dtype=float)
+
+    mask = (t >= t_lo) & (t <= t_hi)
+    if np.count_nonzero(mask) < 3:
+        return np.nan
+
+    slope, _ = np.polyfit(t[mask], dep[mask], 1)
+    return float(slope)
+
+
+def build_summary_row(grade, thickness_mm, result):
+    geom = result.attrs['geometry']
+    t = result['time_h']
+    wl = result['WL_model_pct_mean']
+
+    return dict(
+        Polymer=grade,
+        Model=MODEL_NAME,
+        Out_of_plane_length_mm=OUT_OF_PLANE_LENGTH_MM,
+        Modelled_width_mm=geom['width_mm'],
+        Thickness_mm=geom['thickness_mm'],
+        Edges_exposed=EXPOSE_EDGES,
+        NX=geom['nx'],
+        NY=geom['ny'],
+        Total_cells=geom['total_cells'],
+        DX_mm=geom['dx'],
+        DY_mm=geom['dy'],
+        Cell_aspect_error_pct=100.0 * geom['cell_aspect_error'],
+        Mass_ratio_to_ref=geom['mass_ratio_to_ref'],
+        T_end_h=float(t.iloc[-1]),
+        WL_at_T_compare_pct=value_at_time(t, wl, T_COMPARE),
+        Xc_at_T_compare_pct=value_at_time(
+            t, result['Xc_model_pct_mean'], T_COMPARE
+        ),
+        Depth_at_T_compare_mm=value_at_time(
+            t, result['Eroded_depth_mm_mean'], T_COMPARE
+        ),
+        pH_at_T_compare=value_at_time(t, result['pH_model_mean'], T_COMPARE),
+        Final_WL_pct=float(wl.iloc[-1]),
+        Final_WL_sd_pct=float(result['WL_model_pct_sd'].iloc[-1]),
+        Final_Xc_pct=float(result['Xc_model_pct_mean'].iloc[-1]),
+        Final_Xc_sd_pct=float(result['Xc_model_pct_sd'].iloc[-1]),
+        Final_degraded_fraction_pct=float(
+            result['Degraded_fraction_pct_mean'].iloc[-1]
+        ),
+        Final_P_bath=float(result['P_bath_mean'].iloc[-1]),
+        Max_cell_mass_balance_error=float(
+            result['max_cell_mass_error_mean'].max()
+        ),
+        Time_to_25pct_WL_h=time_to_threshold(t, wl, 25.0),
+        Time_to_50pct_WL_h=time_to_threshold(t, wl, 50.0),
+        Time_to_75pct_WL_h=time_to_threshold(t, wl, 75.0),
+        Front_velocity_mm_per_h=front_velocity(
+            t, result['Eroded_depth_mm_mean']
+        ),
+        Mean_runtime_per_replicate_s=result.attrs['mean_runtime_s'],
+        Total_runtime_all_replicates_s=result.attrs['total_runtime_s'],
+    )
+
+
+# ============================================================================
+# 13) PLOTTING (no titles; information in legend and file names)
+# ============================================================================
+
+def save_comparison_plot(grade, all_results, xcol, mean_col, sd_col,
+                         xlabel, ylabel, filename, ylim=None):
+    fig, ax = plt.subplots(figsize=(9.2, 6.2))
+
+    for thickness_mm, result in all_results:
+        x = result[xcol].to_numpy(dtype=float)
+        mean = result[mean_col].to_numpy(dtype=float)
+        sd = result[sd_col].to_numpy(dtype=float)
+
+        line, = ax.plot(x, mean, lw=2.8, label=f'{thickness_mm:g} mm')
+
+        if N_REP > 1:
+            ax.fill_between(
+                x, mean - sd, mean + sd,
+                alpha=0.12, color=line.get_color(), linewidth=0.0,
+            )
+
+    ax.set_xlabel(xlabel, fontsize=18)
+    ax.set_ylabel(ylabel, fontsize=18)
+    ax.tick_params(axis='both', labelsize=15)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(alpha=0.3)
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    ax.legend(
+        title=grade,
+        fontsize=11,
+        title_fontsize=11,
+        frameon=True,
+        ncol=2,
+    )
+
+    fig.tight_layout()
+    grade_dir = OUTPUT_DIR / grade
+    grade_dir.mkdir(parents=True, exist_ok=True)
+    path = grade_dir / filename
+    fig.savefig(path, dpi=600, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+
+    return path
+
+
+def save_cross_grade_summary_plot(summary_df, ycol, ylabel, filename,
+                                  ylim=None):
+    """One summary quantity against thickness for all grades."""
+    fig, ax = plt.subplots(figsize=(8.8, 6.0))
+
+    for grade in GRADES:
+        d = summary_df.loc[summary_df['Polymer'] == grade]
+        d = d.sort_values('Thickness_mm')
+        ax.plot(
+            d['Thickness_mm'], d[ycol],
+            marker='o', ms=7, lw=2.6, label=grade,
+        )
+
+    ax.set_xlabel('Thickness (mm)', fontsize=18)
+    ax.set_ylabel(ylabel, fontsize=18)
+    ax.tick_params(axis='both', labelsize=15)
+    ax.grid(alpha=0.3)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.legend(fontsize=12, frameon=True)
+    fig.tight_layout()
+
+    path = OUTPUT_DIR / filename
+    fig.savefig(path, dpi=600, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    return path
+
+
+# ============================================================================
+# 14) MAIN
+# ============================================================================
+
+def main():
+    start_all = time.time()
+
+    print('\n' + '=' * 110)
+    print('ALL THREE PCL GRADES: NIWA CA THICKNESS STUDY')
+    print('=' * 110)
+    print('No calibration is performed.')
+    print('Each grade retains its own NIWA PDE-fitted parameters and Xc0.')
+    print('2-D domain: thickness x 10 mm; the 30 mm length is out-of-plane.')
+    print(f'Edges exposed to enzyme: {EXPOSE_EDGES}')
+    print(f'Reference physical cell size = {TARGET_CELL_MM:.6g} mm')
+    print(f'DT = {DT:g} h; T_END = {T_END:g} h for every thickness')
+    print(f'Initial-morphology replicates per case = {N_REP}')
+    print(f'Total cases = {len(GRADES) * len(THICKNESSES_MM)}')
+
+    geometry_rows = []
+    for thickness_mm in THICKNESSES_MM:
+        geom = geometry_to_grid(thickness_mm)
+        geometry_rows.append(geom)
+        print(
+            f'  thickness={thickness_mm:g} mm -> '
+            f'{geom["nx"]} x {geom["ny"]} cells; '
+            f'dx={geom["dx"]:.6g} mm, dy={geom["dy"]:.6g} mm; '
+            f'N={geom["total_cells"]:,}'
+        )
+
+    results_by_grade = {}
+    summary_rows = []
+
+    for grade in GRADES:
+        settings = GRADE_SETTINGS[grade]
+        print('\n' + '=' * 110)
+        print(f'{grade}: XC0={settings["XC0"]:.3f}; fixed NIWA parameters')
+        print('=' * 110)
+
+        grade_results = []
+
+        for thickness_mm in THICKNESSES_MM:
+            geom = geometry_to_grid(thickness_mm)
+
+            print('\n' + '-' * 110)
+            print(
+                f'{grade}: 30 x 10 x {thickness_mm:g} mm film as a '
+                f'{geom["nx"]} x {geom["ny"]} lattice'
+            )
+            print('-' * 110)
+
+            result = simulate_geometry_case(grade, thickness_mm)
+            grade_results.append((thickness_mm, result))
+
+            summary = build_summary_row(grade, thickness_mm, result)
+            summary_rows.append(summary)
+
+            print(
+                f'  WL(20 h)={summary["WL_at_T_compare_pct"]:.2f}% | '
+                f'depth(20 h)={summary["Depth_at_T_compare_mm"]:.4f} mm | '
+                f't50={summary["Time_to_50pct_WL_h"]:.2f} h | '
+                f'v_front={summary["Front_velocity_mm_per_h"]:.5f} mm/h'
+            )
+
+        results_by_grade[grade] = grade_results
+
+    summary_df = pd.DataFrame(summary_rows)
+    geometry_df = pd.DataFrame(geometry_rows)
+
+    parameter_rows = []
+    metadata_rows = []
+    for grade in GRADES:
+        settings = GRADE_SETTINGS[grade]
+        parameter_rows.append(dict(
+            Polymer=grade,
+            Model=MODEL_NAME,
+            k2=settings['k2'],
+            k1=settings['k1'],
+            kc=settings['kc'],
+            ka=settings['ka'],
+            km=settings['km'],
+            ke=settings['ke'],
+            De0=settings['De0'],
+            alpha_pH=settings['alpha'],
+            Xc0=settings['XC0'],
+        ))
+
+        metadata_rows.append(dict(
+            Polymer=grade,
+            Model=MODEL_NAME,
+            Model_description=MODEL_DESCRIPTION,
+            Out_of_plane_length_mm=OUT_OF_PLANE_LENGTH_MM,
+            Modelled_width_mm=IN_PLANE_WIDTH_MM,
+            Reference_thickness_mm=REF_THICKNESS_MM,
+            Reference_NX=REF_NX,
+            Target_cell_size_mm=TARGET_CELL_MM,
+            DT_h=DT,
+            T_END_h=T_END,
+            E_T=E_T,
+            Xc0=settings['XC0'],
+            pH0=PH0,
+            pH_rule='pH0 - alpha * P_bath; NaN if P_bath > PH_VALID_P_MAX',
+            PH_VALID_P_MAX=PH_VALID_P_MAX,
+            N_replicates=N_REP,
+            State_sum_constraint='C+A+ZC+ZA+D+V=1',
+            Porosity_definition='phi=V',
+            Face_diffusivity='De0*max(phi_L,phi_R)',
+            Boundary_condition=(
+                'E=E_T on all four boundaries' if EXPOSE_EDGES
+                else 'E=E_T on both faces; zero flux at edges'
+            ),
+            Splitting='Strang: reaction half -> diffusion full -> reaction half',
+            Geometry_variable='film thickness',
+            Recalibration_per_geometry=False,
+        ))
+
+    parameter_df = pd.DataFrame(parameter_rows)
+    metadata_df = pd.DataFrame(metadata_rows)
+
+    excel_path = OUTPUT_DIR / 'ALL_PCL_GRADES_NIWA_CA_thickness_study.xlsx'
+
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        metadata_df.to_excel(writer, sheet_name='Model_metadata', index=False)
+        parameter_df.to_excel(writer, sheet_name='Fixed_parameters', index=False)
+        geometry_df.to_excel(writer, sheet_name='Geometry_grids', index=False)
+        summary_df.to_excel(writer, sheet_name='Summary_all_cases', index=False)
+
+        for grade in GRADES:
+            for thickness_mm, result in results_by_grade[grade]:
+                short_grade = grade.replace('PCL', '')
+                tcode = f'{thickness_mm:g}'.replace('.', 'p')
+                sheet = f'{short_grade}_t{tcode}mm'[:31]
+                result.to_excel(writer, sheet_name=sheet, index=False)
+
+    summary_csv = OUTPUT_DIR / 'ALL_PCL_GRADES_NIWA_CA_thickness_summary.csv'
+    summary_df.to_csv(summary_csv, index=False)
+
+    # ------------------------------------------------------------------------
+    # Per-grade figures
+    # ------------------------------------------------------------------------
+    per_grade_paths = []
+    for grade in GRADES:
+        gr = results_by_grade[grade]
+
+        per_grade_paths.append(save_comparison_plot(
+            grade, gr, 'time_h', 'WL_model_pct_mean', 'WL_model_pct_sd',
+            'Time (h)', 'Weight loss (%)',
+            f'{grade}_NIWA_thickness_weight_loss.png', ylim=(0.0, 100.0),
+        ))
+
+        # Key verification figure: should collapse for surface erosion.
+        per_grade_paths.append(save_comparison_plot(
+            grade, gr, 'time_h',
+            'Eroded_depth_mm_mean', 'Eroded_depth_mm_sd',
+            'Time (h)', 'Eroded depth (mm)',
+            f'{grade}_NIWA_thickness_eroded_depth.png',
+        ))
+
+        per_grade_paths.append(save_comparison_plot(
+            grade, gr, 'time_h', 'Xc_model_pct_mean', 'Xc_model_pct_sd',
+            'Time (h)', 'Xc (%)',
+            f'{grade}_NIWA_thickness_crystallinity.png', ylim=(0.0, 70.0),
+        ))
+
+        per_grade_paths.append(save_comparison_plot(
+            grade, gr, 'time_h',
+            'Degraded_fraction_pct_mean', 'Degraded_fraction_pct_sd',
+            'Time (h)', 'Degraded fraction (%)',
+            f'{grade}_NIWA_thickness_degraded_fraction.png',
+        ))
+
+        per_grade_paths.append(save_comparison_plot(
+            grade, gr, 'time_h', 'pH_model_mean', 'pH_model_sd',
+            'Time (h)', 'Bath pH',
+            f'{grade}_NIWA_thickness_pH.png', ylim=(3.8, 7.4),
+        ))
+
+    # ------------------------------------------------------------------------
+    # Cross-grade summaries
+    # ------------------------------------------------------------------------
+    cross_grade_paths = []
+    cross_grade_paths.append(save_cross_grade_summary_plot(
+        summary_df, 'Depth_at_T_compare_mm', f'Depth at {T_COMPARE:g} h (mm)',
+        'ALL_GRADES_eroded_depth_at_20h_vs_thickness.png',
+    ))
+    cross_grade_paths.append(save_cross_grade_summary_plot(
+        summary_df, 'Front_velocity_mm_per_h', 'Front velocity (mm/h)',
+        'ALL_GRADES_front_velocity_vs_thickness.png',
+    ))
+    cross_grade_paths.append(save_cross_grade_summary_plot(
+        summary_df, 'WL_at_T_compare_pct', f'WL at {T_COMPARE:g} h (%)',
+        'ALL_GRADES_WL_at_20h_vs_thickness.png', ylim=(0.0, 100.0),
+    ))
+    cross_grade_paths.append(save_cross_grade_summary_plot(
+        summary_df, 'Final_Xc_pct', 'Final Xc (%)',
+        'ALL_GRADES_final_crystallinity_vs_thickness.png', ylim=(0.0, 70.0),
+    ))
+
+    elapsed_all = time.time() - start_all
+
+    print('\n' + '=' * 110)
+    print('THICKNESS STUDY COMPLETED')
+    print('=' * 110)
+    print(summary_df.to_string(index=False))
+    print(f'\nTotal runtime: {elapsed_all:.1f} s')
+    print(f'Excel: {excel_path}')
+    print(f'Summary CSV: {summary_csv}')
+    print(f'Output folder: {OUTPUT_DIR}')
+    print(f'Per-grade plots created: {len(per_grade_paths)}')
+    print(f'Cross-grade summary plots created: {len(cross_grade_paths)}')
+
+
+if __name__ == '__main__':
+    main()
